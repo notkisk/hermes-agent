@@ -6,7 +6,22 @@ import json
 from typing import Any, Dict, Iterable, Optional
 from urllib.parse import urlparse
 
-import httpx
+# ``httpx`` is only used inside this client's network calls below. Resolved
+# lazily (``_ensure_httpx()`` populates the module global at those call
+# sites) so plugin discovery at startup stays off the HTTP SDK's import cost.
+
+
+def _ensure_httpx():
+    if "httpx" not in globals():
+        import httpx as _m
+        globals()["httpx"] = _m
+    return globals()["httpx"]
+
+
+def __getattr__(name: str):
+    if name == "httpx":
+        return _ensure_httpx()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 from hermes_cli.auth import (
     AuthError,
@@ -71,6 +86,7 @@ class SpotifyClient:
         allow_retry_on_401: bool = True,
         empty_response: Optional[Dict[str, Any]] = None,
     ) -> Any:
+        _ensure_httpx()
         url = f"{self.base_url}{path}"
         response = httpx.request(
             method,
@@ -98,6 +114,7 @@ class SpotifyClient:
         return {"success": True, "text": response.text}
 
     def _raise_api_error(self, response: httpx.Response, *, method: str, path: str) -> None:
+        _ensure_httpx()
         detail = response.text.strip()
         message = _friendly_spotify_error_message(
             status_code=response.status_code,
@@ -322,6 +339,7 @@ class SpotifyClient:
 
 
 def _extract_spotify_error_detail(response: httpx.Response, *, fallback: str) -> str:
+    _ensure_httpx()
     detail = fallback
     try:
         payload = response.json()

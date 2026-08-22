@@ -42,7 +42,21 @@ import os
 import re
 import asyncio
 from typing import List, Dict, Any, Optional, TYPE_CHECKING
-import httpx  # noqa: F401 — kept at module top so tests can patch tools.web_tools.httpx
+
+# ``httpx`` (~55 ms of cold import) is no longer used inside this module's
+# own code paths (web fetching moved to the provider plugins), but tests
+# reach for ``patch("tools.web_tools.httpx.post", ...)`` as a stable patch
+# surface. The PEP 562 ``__getattr__`` keeps that working without paying
+# the SDK import on the tool-discovery path.
+
+
+def __getattr__(name: str):
+    if name == "httpx":
+        import httpx as _httpx
+        globals()["httpx"] = _httpx
+        return _httpx
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 # After the web-provider plugin migration (PR #25182), the Firecrawl SDK
 # proxy, client construction, and response-shape normalizers all live in
 # plugins.web.firecrawl.provider. We re-export the names that external

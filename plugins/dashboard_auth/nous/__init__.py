@@ -77,7 +77,22 @@ import secrets
 import urllib.parse
 from typing import Any, Dict, Optional
 
-import httpx
+# ``httpx`` is only used inside this plugin's network calls below. Resolved
+# lazily (``_ensure_httpx()`` populates the module global at those call
+# sites) so plugin discovery at startup stays off the HTTP SDK's import cost.
+
+
+def _ensure_httpx():
+    if "httpx" not in globals():
+        import httpx as _m
+        globals()["httpx"] = _m
+    return globals()["httpx"]
+
+
+def __getattr__(name: str):
+    if name == "httpx":
+        return _ensure_httpx()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 from hermes_cli.dashboard_auth import (
     DashboardAuthProvider,
@@ -216,6 +231,7 @@ class NousDashboardAuthProvider(DashboardAuthProvider):
         # (it checks the cookie-stashed state matches the query-param state);
         # we just receive it for symmetry with the protocol. Nous Portal
         # doesn't re-check state at the token endpoint, so we ignore it here.
+        _ensure_httpx()
         _ = state
 
         try:
@@ -260,6 +276,7 @@ class NousDashboardAuthProvider(DashboardAuthProvider):
         detected), so the middleware clears cookies and forces re-login.
         Raises ``ProviderError`` if Portal is unreachable.
         """
+        _ensure_httpx()
         if not refresh_token:
             # No RT to present — treat as a dead session so middleware
             # forces a clean re-login rather than emitting a malformed POST.
@@ -315,6 +332,7 @@ class NousDashboardAuthProvider(DashboardAuthProvider):
         for the refresh path — so the middleware's distinct handling
         (400-on-callback vs. force-relogin) is preserved.
         """
+        _ensure_httpx()
         if response.status_code == 400:
             # Contract: invalid_code / invalid_grant / redirect_uri_mismatch
             # (auth-code) and expired / revoked / reuse-detected (refresh) all
@@ -403,6 +421,7 @@ class NousDashboardAuthProvider(DashboardAuthProvider):
             )
 
     def _parse_json_body(self, response: httpx.Response) -> Dict[str, Any]:
+        _ensure_httpx()
         ctype = response.headers.get("content-type", "")
         if not ctype.startswith("application/json"):
             return {}

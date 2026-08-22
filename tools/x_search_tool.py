@@ -51,7 +51,23 @@ import time
 from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-import requests
+# ``requests`` is only used by the X search call below. Resolved lazily
+# (``_ensure_requests()`` populates the module global at those call sites)
+# so importing this module on the tool-discovery path stays off the HTTP
+# SDK's import cost.
+
+
+def _ensure_requests():
+    if "requests" not in globals():
+        import requests as _requests
+        globals()["requests"] = _requests
+    return globals()["requests"]
+
+
+def __getattr__(name: str):
+    if name == "requests":
+        return _ensure_requests()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 from tools.registry import registry, tool_error
 from tools.xai_http import hermes_xai_user_agent, resolve_xai_http_credentials
@@ -272,6 +288,7 @@ def _extract_inline_citations(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def _http_error_message(exc: requests.HTTPError) -> str:
+    _ensure_requests()
     response = getattr(exc, "response", None)
     if response is None:
         return str(exc)
@@ -308,6 +325,7 @@ def x_search_tool(
     enable_image_understanding: bool = False,
     enable_video_understanding: bool = False,
 ) -> str:
+    _ensure_requests()
     if not query or not query.strip():
         return tool_error("query is required for x_search")
 

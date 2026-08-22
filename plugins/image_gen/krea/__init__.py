@@ -28,7 +28,22 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
-import requests
+# ``requests`` is only used inside this plugin's network calls below. Resolved
+# lazily (``_ensure_requests()`` populates the module global at those call
+# sites) so plugin discovery at startup stays off the HTTP SDK's import cost.
+
+
+def _ensure_requests():
+    if "requests" not in globals():
+        import requests as _m
+        globals()["requests"] = _m
+    return globals()["requests"]
+
+
+def __getattr__(name: str):
+    if name == "requests":
+        return _ensure_requests()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 from agent.secret_scope import get_secret
 from agent.image_gen_provider import (
@@ -251,6 +266,7 @@ def _poll_krea_job(
     jobs (the Enhance upscale pass): any failure returns ``None`` so the
     caller can fall back instead of failing the whole generation.
     """
+    _ensure_requests()
     job_url = f"{base_url}/jobs/{job_id}"
     headers = {
         "Authorization": f"Bearer {auth_token}",
@@ -318,6 +334,7 @@ def _enhance_image(
     the caller falls back to the original (un-upscaled) image — an upscale
     failure must never destroy an already-successful generation.
     """
+    _ensure_requests()
     headers = {
         "Authorization": f"Bearer {auth_token}",
         "Content-Type": "application/json",
@@ -422,6 +439,7 @@ class KreaImageGenProvider(ImageGenProvider):
         reference_image_urls: Optional[List[str]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
+        _ensure_requests()
         prompt = (prompt or "").strip()
         aspect = resolve_aspect_ratio(aspect_ratio)
         krea_ar = _ASPECT_MAP.get(aspect, "1:1")

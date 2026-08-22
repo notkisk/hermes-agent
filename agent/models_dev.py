@@ -49,7 +49,17 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from utils import atomic_json_write
 
-import requests
+# ``requests`` is only used by the live catalog refresh below. Resolved
+# lazily (``_ensure_requests()`` populates the module global at those call
+# sites) so importing this module on the startup path stays off the HTTP
+# SDK's import cost.
+
+
+def _ensure_requests():
+    if "requests" not in globals():
+        import requests as _requests
+        globals()["requests"] = _requests
+    return globals()["requests"]
 
 logger = logging.getLogger(__name__)
 
@@ -417,12 +427,14 @@ def _fetch_models_dev_from_network(
     it vouches for. Raises on network errors and on an empty/invalid
     registry payload.
     """
+    _ensure_requests()
     url = _get_models_dev_url()
     headers: Dict[str, str] = {}
     if conditional:
         etag = _load_etag()
         if etag:
             headers["If-None-Match"] = etag
+
 
     # Tuple (connect, read): a flat timeout=15 let a blackholed connect
     # stall the first-turn critical path for the full 15 s. 5 s connect

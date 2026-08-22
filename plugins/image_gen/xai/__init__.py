@@ -22,7 +22,22 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import requests
+# ``requests`` is only used inside this plugin's network calls below. Resolved
+# lazily (``_ensure_requests()`` populates the module global at those call
+# sites) so plugin discovery at startup stays off the HTTP SDK's import cost.
+
+
+def _ensure_requests():
+    if "requests" not in globals():
+        import requests as _m
+        globals()["requests"] = _m
+    return globals()["requests"]
+
+
+def __getattr__(name: str):
+    if name == "requests":
+        return _ensure_requests()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 from agent.image_gen_provider import (
     DEFAULT_ASPECT_RATIO,
@@ -357,6 +372,7 @@ class XAIImageGenProvider(ImageGenProvider):
         a JSON body (the OpenAI SDK's multipart ``images.edit()`` is NOT
         supported by xAI).
         """
+        _ensure_requests()
         creds = resolve_xai_http_credentials()
         api_key = str(creds.get("api_key") or "").strip()
         provider_name = str(creds.get("provider") or "xai").strip() or "xai"

@@ -27,7 +27,23 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import httpx
+# ``httpx`` (~55 ms of cold import) is only used by the video submission /
+# polling calls below. Resolved lazily: ``_ensure_httpx()`` populates the
+# module global at those call sites, and the PEP 562 ``__getattr__`` keeps
+# external attribute access working.
+
+
+def _ensure_httpx():
+    if "httpx" not in globals():
+        import httpx as _httpx
+        globals()["httpx"] = _httpx
+    return globals()["httpx"]
+
+
+def __getattr__(name: str):
+    if name == "httpx":
+        return _ensure_httpx()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 from agent.video_gen_provider import (
     VideoGenProvider,
@@ -312,6 +328,7 @@ async def _submit(
     endpoint: str = "generations",
 ) -> str:
     """POST to one of xAI's async video endpoints and return request_id."""
+    _ensure_httpx()
     response = await client.post(
         f"{base_url}/videos/{endpoint}",
         headers={**_xai_headers(api_key), "x-idempotency-key": str(uuid.uuid4())},
@@ -335,6 +352,7 @@ async def _poll(
     timeout_seconds: int,
     poll_interval: int,
 ) -> Dict[str, Any]:
+    _ensure_httpx()
     elapsed = 0.0
     last_status = "queued"
     while elapsed < timeout_seconds:
@@ -790,6 +808,7 @@ async def _submit_xai_video_payload(
     operation: str,
     resolution: Optional[str] = None,
 ) -> Dict[str, Any]:
+    _ensure_httpx()
     try:
         from tools.xai_http import (
             build_xai_storage_options,

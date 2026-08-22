@@ -85,7 +85,22 @@ import time
 import urllib.parse
 from typing import Any, Dict, Optional
 
-import httpx
+# ``httpx`` is only used inside this plugin's network calls below. Resolved
+# lazily (``_ensure_httpx()`` populates the module global at those call
+# sites) so plugin discovery at startup stays off the HTTP SDK's import cost.
+
+
+def _ensure_httpx():
+    if "httpx" not in globals():
+        import httpx as _m
+        globals()["httpx"] = _m
+    return globals()["httpx"]
+
+
+def __getattr__(name: str):
+    if name == "httpx":
+        return _ensure_httpx()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 from hermes_cli.dashboard_auth import (
     DashboardAuthProvider,
@@ -321,6 +336,7 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
     def revoke_session(self, *, refresh_token: str) -> None:
         # Best-effort RFC 7009 revocation if the IDP advertised an endpoint.
         # Must never raise — logout is client-side cookie clearing regardless.
+        _ensure_httpx()
         if not refresh_token:
             return None
         try:
@@ -420,6 +436,7 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
         a public client, so the request is byte-identical to the pre-
         confidential-client behaviour in that case.
         """
+        _ensure_httpx()
         headers = {"Accept": "application/json"}
         if extra_headers:
             headers.update(extra_headers)
@@ -504,6 +521,7 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
         return f"{self._issuer}/.well-known/openid-configuration"
 
     def _fetch_discovery(self) -> Dict[str, Any]:
+        _ensure_httpx()
         url = self._discovery_url()
         try:
             # follow_redirects=True: many IDPs answer the discovery GET with a
@@ -731,6 +749,7 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
             )
 
     def _parse_json_body(self, response: httpx.Response) -> Dict[str, Any]:
+        _ensure_httpx()
         ctype = response.headers.get("content-type", "")
         if not ctype.startswith("application/json"):
             return {}

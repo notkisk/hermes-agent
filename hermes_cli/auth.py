@@ -757,6 +757,7 @@ def _probe_single_zai_endpoint(
     ``probe_models`` LIST and each model is tried in order until one
     succeeds (some plans only accept newer/older GLM slugs).
     """
+    _ensure_httpx()
     ep_id, base_url, probe_models, label = endpoint
     for model in probe_models:
         try:
@@ -2791,6 +2792,7 @@ def _qwen_access_token_is_expiring(expiry_date_ms: Any, skew_seconds: int = QWEN
 
 
 def _refresh_qwen_cli_tokens(tokens: Dict[str, Any], timeout_seconds: float = 20.0) -> Dict[str, Any]:
+    _ensure_httpx()
     refresh_token = str(tokens.get("refresh_token", "") or "").strip()
     if not refresh_token:
         raise AuthError(
@@ -3216,6 +3218,7 @@ def _spotify_exchange_code_for_tokens(
     accounts_base_url: str,
     timeout_seconds: float = 20.0,
 ) -> Dict[str, Any]:
+    _ensure_httpx()
     try:
         response = httpx.post(
             f"{accounts_base_url}/api/token",
@@ -3259,6 +3262,7 @@ def _refresh_spotify_oauth_state(
     *,
     timeout_seconds: float = 20.0,
 ) -> Dict[str, Any]:
+    _ensure_httpx()
     refresh_token = str(state.get("refresh_token", "") or "").strip()
     if not refresh_token:
         raise AuthError(
@@ -3941,6 +3945,7 @@ def refresh_codex_oauth_pure(
     timeout_seconds: float = 20.0,
 ) -> Dict[str, Any]:
     """Refresh Codex OAuth tokens without mutating Hermes auth state."""
+    _ensure_httpx()
     del access_token  # Access token is only used by callers to decide whether to refresh.
     if not isinstance(refresh_token, str) or not refresh_token.strip():
         raise AuthError(
@@ -4365,6 +4370,7 @@ def _probe_codex_quota_restored(
     Probes are throttled per access token (module-local cache) so the hot
     selection path can fire this freely.
     """
+    _ensure_httpx()
     token = str(access_token or "").strip()
     if not token:
         return None
@@ -4957,6 +4963,7 @@ def _xai_validate_inference_base_url(value: str, *, fallback: str) -> str:
 
 
 def _xai_oauth_discovery(timeout_seconds: float = 15.0) -> Dict[str, str]:
+    _ensure_httpx()
     try:
         response = httpx.get(
             XAI_OAUTH_DISCOVERY_URL,
@@ -5012,6 +5019,7 @@ def refresh_xai_oauth_pure(
     token_endpoint: str = "",
     timeout_seconds: float = 20.0,
 ) -> Dict[str, Any]:
+    _ensure_httpx()
     del access_token
     if not isinstance(refresh_token, str) or not refresh_token.strip():
         raise AuthError(
@@ -5309,6 +5317,7 @@ def _request_device_code(
     scope: Optional[str],
 ) -> Dict[str, Any]:
     """POST to the device code endpoint. Returns device_code, user_code, etc."""
+    _ensure_httpx()
     response = client.post(
         f"{portal_base_url}/api/oauth/device/code",
         data={
@@ -5357,6 +5366,7 @@ def _poll_for_token(
     poll_interval: int,
 ) -> Dict[str, Any]:
     """Poll the token endpoint until the user approves or the code expires."""
+    _ensure_httpx()
     deadline = time.monotonic() + max(1, expires_in)
     current_interval = max(1, min(poll_interval, DEVICE_AUTH_POLL_INTERVAL_CAP_SECONDS))
 
@@ -5892,6 +5902,7 @@ def _refresh_access_token(
     client_id: str,
     refresh_token: str,
 ) -> Dict[str, Any]:
+    _ensure_httpx()
     response = client.post(
         f"{portal_base_url}/api/oauth/token",
         headers={"x-nous-refresh-token": refresh_token},
@@ -5951,6 +5962,7 @@ def fetch_nous_models(
     verify: bool | str = True,
 ) -> List[str]:
     """Fetch available model IDs from the Nous inference API."""
+    _ensure_httpx()
     timeout = httpx.Timeout(timeout_seconds)
     with httpx.Client(timeout=timeout, headers={"Accept": "application/json"}, verify=verify) as client:
         response = client.get(
@@ -6032,6 +6044,7 @@ def resolve_nous_access_token(
     refresh_skew_seconds: int = ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
 ) -> str:
     """Resolve a refresh-aware Nous Portal access token for managed tool gateways."""
+    _ensure_httpx()
     global _RESOLVE_TOKEN_CACHE
     # Memo: collapse the startup burst of managed-tool check_fns into one
     # network refresh. Only cache a successful, non-forced resolution for a
@@ -6194,6 +6207,7 @@ def refresh_nous_oauth_pure(
     Callers that own persistent state can use it to save the newly rotated
     refresh token before later validation can fail.
     """
+    _ensure_httpx()
     state: Dict[str, Any] = {
         "access_token": access_token,
         "refresh_token": refresh_token,
@@ -6386,6 +6400,7 @@ def resolve_nous_runtime_credentials(
     Returns dict with: provider, base_url, api_key, key_id, expires_at,
     expires_in, source ("invoke_jwt"), and auth_path.
     """
+    _ensure_httpx()
     sequence_id = uuid.uuid4().hex[:12]
 
     with _provider_state_transaction("nous") as (
@@ -8111,6 +8126,7 @@ def _xai_oauth_request_device_code(
     *,
     scope: str = XAI_OAUTH_SCOPE,
 ) -> Dict[str, Any]:
+    _ensure_httpx()
     response = client.post(
         XAI_OAUTH_DEVICE_CODE_URL,
         headers={
@@ -8156,6 +8172,7 @@ def _xai_oauth_poll_device_token(
     expires_in: int,
     poll_interval: int,
 ) -> Dict[str, Any]:
+    _ensure_httpx()
     deadline = time.monotonic() + max(1, int(expires_in))
     current_interval = max(1, int(poll_interval))
     while time.monotonic() < deadline:
@@ -8226,6 +8243,7 @@ def _xai_oauth_device_code_login(
     timeout_seconds: float = 20.0,
     open_browser: bool = True,
 ) -> Dict[str, Any]:
+    _ensure_httpx()
     discovery = _xai_oauth_discovery(timeout_seconds)
     token_endpoint = discovery["token_endpoint"]
     timeout = httpx.Timeout(max(20.0, timeout_seconds))
@@ -8293,6 +8311,7 @@ def _xai_oauth_device_code_login(
 
 def _codex_device_code_login() -> Dict[str, Any]:
     """Run the OpenAI device code login flow and return credentials dict."""
+    _ensure_httpx()
     import time as _time
 
     issuer = "https://auth.openai.com"
@@ -8501,6 +8520,7 @@ def _minimax_response_error_text(
     limit: int = _MINIMAX_OAUTH_ERROR_BODY_LIMIT,
 ) -> str:
     """Return a bounded error body from a streamed MiniMax OAuth response."""
+    _ensure_httpx()
     limit = max(0, int(limit))
     chunks: list[bytes] = []
     total = 0
@@ -8543,6 +8563,7 @@ def _minimax_post_form(
     headers: Dict[str, str],
 ) -> httpx.Response:
     """POST a MiniMax OAuth form without eagerly reading error bodies."""
+    _ensure_httpx()
     request = client.build_request(
         "POST",
         url,
@@ -8569,6 +8590,7 @@ def _minimax_request_user_code(
     client: httpx.Client, *, portal_base_url: str, client_id: str,
     code_challenge: str, state: str,
 ) -> Dict[str, Any]:
+    _ensure_httpx()
     response = _minimax_post_form(
         client,
         f"{portal_base_url}/oauth/code",
@@ -8627,6 +8649,7 @@ def _minimax_poll_token(
 ) -> Dict[str, Any]:
     # OpenClaw treats expired_in as a unix-ms timestamp (Date.now() < expireTimeMs).
     # Defensive parsing: if it's small enough to be a duration, treat as seconds.
+    _ensure_httpx()
     import time as _time
     now_ms = int(_time.time() * 1000)
     raw = int(expired_in)
@@ -8703,6 +8726,7 @@ def _minimax_oauth_login(
     timeout_seconds: float = 15.0,
 ) -> Dict[str, Any]:
     """Run MiniMax OAuth flow, persist tokens, return auth state dict."""
+    _ensure_httpx()
     pconfig = PROVIDER_REGISTRY["minimax-oauth"]
     if region == "cn":
         portal_base_url = pconfig.extra["cn_portal_base_url"]
@@ -8786,6 +8810,7 @@ def _refresh_minimax_oauth_state(
     force: bool = False,
 ) -> Dict[str, Any]:
     """Refresh MiniMax OAuth access token if close to expiry (or forced)."""
+    _ensure_httpx()
     if not state.get("refresh_token"):
         raise AuthError(
             "MiniMax OAuth state has no refresh_token; please re-login.",
@@ -9011,6 +9036,7 @@ def _nous_device_code_login(
     on_verification: Optional[Callable[[str, str], None]] = None,
 ) -> Dict[str, Any]:
     """Run the Nous device-code flow and return full OAuth state without persisting."""
+    _ensure_httpx()
     pconfig = PROVIDER_REGISTRY["nous"]
     portal_base_url = (
         portal_base_url

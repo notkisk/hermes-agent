@@ -624,6 +624,193 @@ class TestVisionRequirements:
         assert len(calls) == 2  # cache expired — recomputed
 
 
+class TestVisionVerdictDiskCache:
+    """The vision verdict persists across processes keyed by config fingerprint.
+
+    The in-process TTL dies with the process; without the disk layer every
+    CLI cold start re-walked the auxiliary chain and constructed throwaway
+    OpenAI clients — synchronously importing the openai/httpx SDKs before
+    the banner could render.
+    """
+
+    def setup_method(self):
+        import tools.vision_tools as vt
+        vt._vision_check_cache = (False, 0.0)
+
+    def teardown_method(self):
+        import tools.vision_tools as vt
+        vt._vision_check_cache = (False, 0.0)
+
+    def test_save_and_load_roundtrip(self):
+        import time as _time
+        import json
+        import tools.vision_tools as vt
+
+        fp = "fingerprint-abc"
+        vt._save_vision_verdict_disk(fp, True)
+        entry = vt._load_vision_verdict_disk(fp)
+        assert entry is not None and entry[0] is True
+        vt._save_vision_verdict_disk(fp, False)
+        assert vt._load_vision_verdict_disk(fp)[0] is False
+
+        # Stale entries still load — staleness is the caller's SWR decision.
+        blob_path = vt._vision_verdict_disk_path()
+        blob = json.loads(blob_path.read_text())
+        blob["ts"] = _time.time() - vt._VISION_DISK_TTL_SECONDS - 1
+        blob_path.write_text(json.dumps(blob))
+        entry = vt._load_vision_verdict_disk(fp)
+        assert entry is not None and entry[1] > vt._VISION_DISK_TTL_SECONDS
+
+    def test_load_rejects_mismatched_fingerprint_and_corruption(self):
+        import tools.vision_tools as vt
+
+        vt._save_vision_verdict_disk("fp-a", True)
+        assert vt._load_vision_verdict_disk("fp-b") is None
+
+        path = vt._vision_verdict_disk_path()
+        path.write_text("{not json")
+        assert vt._load_vision_verdict_disk("fp-a") is None
+
+        path.write_text('{"fp": "fp-a", "ok": "yes", "ts": 1}')
+        assert vt._load_vision_verdict_disk("fp-a") is None
+
+    def test_stale_entry_serves_and_refreshes_in_background(self, monkeypatch):
+        """Stale-while-revalidate: serve last-known-good now, refresh off-thread."""
+        import time as _time
+        import json
+        import tools.vision_tools as vt
+
+        fp = vt._vision_config_fingerprint()
+        path = vt._vision_verdict_disk_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "fp": fp,
+            "ok": True,
+            "ts": _time.time() - vt._VISION_DISK_TTL_SECONDS - 1,
+        }))
+
+        captured = []
+
+        class _CapturingThread:
+            def __init__(self, target=None, name=None, daemon=False):
+                self._target = target
+                captured.append(self)
+
+            def start(self):
+                pass
+
+        monkeypatch.setattr(vt, "_vision_check_cache", (False, 0.0))
+        with patch(
+            "agent.auxiliary_client.resolve_vision_provider_client"
+        ) as mock_resolve, patch("tools.vision_tools.threading.Thread", _CapturingThread):
+            result = check_vision_requirements()
+
+        # Served synchronously without walking the chain...
+        mock_resolve.assert_not_called()
+        assert result is True
+        assert len(captured) == 1
+
+        # ...and the background refresh recomputes + re-persists.
+        def fake_resolve(provider=None, model=None, **kwargs):
+            return provider or "openrouter", object(), "m"
+
+        with (
+            patch(
+                "agent.auxiliary_client.resolve_vision_provider_client",
+                side_effect=fake_resolve,
+            ),
+            patch.object(vt, "_vision_config_fingerprint", return_value=fp),
+        ):
+            captured[0]._target()
+        blob = json.loads(path.read_text())
+        assert _time.time() - blob["ts"] < 60
+
+    def test_fingerprint_covers_credential_env_values(self, monkeypatch):
+        import tools.vision_tools as vt
+
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        fp_base = vt._vision_config_fingerprint()
+
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-value-a")
+        fp_a = vt._vision_config_fingerprint()
+        assert fp_a != fp_base
+
+        # Rotating the key must change the fingerprint too.
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-value-b")
+        assert vt._vision_config_fingerprint() != fp_a
+
+    def test_check_recomputes_when_credentials_change(self, monkeypatch):
+        """A rotated key must not serve the previous verdict from disk."""
+        import tools.vision_tools as vt
+
+        calls = []
+
+        def fake_resolve(provider=None, model=None, **kwargs):
+            calls.append(provider)
+            return provider or "openrouter", object(), "m"
+
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-first")
+        with patch(
+            "agent.auxiliary_client.resolve_vision_provider_client",
+            side_effect=fake_resolve,
+        ):
+            assert check_vision_requirements() is True
+            assert len(calls) == 1
+
+            # Same config: served without recomputing.
+            vt._vision_check_cache = (False, 0.0)
+            assert check_vision_requirements() is True
+            assert len(calls) == 1
+
+            # Rotated credential: different fingerprint → recompute + re-persist.
+            monkeypatch.setenv("OPENROUTER_API_KEY", "sk-second")
+            vt._vision_check_cache = (False, 0.0)
+            assert check_vision_requirements() is True
+            assert len(calls) == 2
+
+    def test_warm_process_skips_sdk_imports(self):
+        """Fresh process with a warm verdict serves it without openai/httpx."""
+        import os
+        import subprocess
+        import sys
+        import tempfile
+
+        tmp = tempfile.mkdtemp(prefix="hermes_vision_disk_")
+        repo_root = str(Path(__file__).resolve().parents[2])
+        env = dict(os.environ)
+        env["HERMES_HOME"] = tmp
+        env["OPENROUTER_API_KEY"] = "sk-warm"
+        env["PYTHONPATH"] = repo_root + os.pathsep + env.get("PYTHONPATH", "")
+
+        # Pass 1: cold — computes, constructs clients, persists the verdict.
+        cold = subprocess.run(
+            [sys.executable, "-c",
+             "import sys\n"
+             "import tools.vision_tools as vt\n"
+             "assert vt.check_vision_requirements() is True\n"
+             "assert 'openai' in sys.modules and 'httpx' in sys.modules\n"],
+            capture_output=True, text=True, env=env,
+        )
+        assert cold.returncode == 0, cold.stderr[-2000:]
+
+        # Pass 2: warm fresh process — verdict served WITHOUT importing SDKs.
+        warm = subprocess.run(
+            [sys.executable, "-c",
+             "import sys\n"
+             "import tools.vision_tools as vt\n"
+             "ok = vt.check_vision_requirements()\n"
+             "heavy = [m for m in ('openai', 'httpx') if m in sys.modules]\n"
+             "print('RESULT:', ok, heavy)\n"],
+            capture_output=True, text=True, env=env,
+        )
+        assert warm.returncode == 0, warm.stderr[-2000:]
+        line = [l for l in warm.stdout.splitlines() if l.startswith("RESULT:")][0]
+        _, ok, heavy = line.split()
+        assert ok == "True", line
+        assert heavy == "[]", f"SDKs loaded on warm path: {line}"
+
+
+
 # ---------------------------------------------------------------------------
 # Local path forms: tilde expansion and file:// URIs
 # ---------------------------------------------------------------------------

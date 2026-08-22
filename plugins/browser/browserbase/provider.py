@@ -36,7 +36,24 @@ import os
 import uuid
 from typing import Any, Dict, Optional
 
-import requests
+# ``requests`` (~26 ms of cold import) is only used by this provider's
+# cloud-API calls below. Resolved lazily: ``_ensure_requests()`` populates
+# the module global at those call sites so importing this module (which
+# ``tools/browser_tool.py`` does at discovery time for its legacy re-export
+# surface) stays off the HTTP SDK's import cost.
+
+
+def _ensure_requests():
+    if "requests" not in globals():
+        import requests as _requests
+        globals()["requests"] = _requests
+    return globals()["requests"]
+
+
+def __getattr__(name: str):
+    if name == "requests":
+        return _ensure_requests()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 from agent.browser_provider import BrowserProvider
 from agent.secret_scope import get_secret
@@ -93,6 +110,7 @@ class BrowserbaseBrowserProvider(BrowserProvider):
     # ------------------------------------------------------------------
 
     def create_session(self, task_id: str) -> Dict[str, object]:
+        _ensure_requests()
         config = self._get_config()
 
         # Optional env-var knobs
@@ -216,6 +234,7 @@ class BrowserbaseBrowserProvider(BrowserProvider):
         }
 
     def close_session(self, session_id: str) -> bool:
+        _ensure_requests()
         try:
             config = self._get_config()
         except ValueError:
@@ -253,6 +272,7 @@ class BrowserbaseBrowserProvider(BrowserProvider):
             return False
 
     def emergency_cleanup(self, session_id: str) -> None:
+        _ensure_requests()
         config = self._get_config_or_none()
         if config is None:
             logger.warning(

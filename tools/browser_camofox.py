@@ -34,7 +34,23 @@ import uuid
 from typing import Any, Dict, Optional
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 
-import requests
+# ``requests`` is only used by the camofox REST calls below. Resolved lazily
+# (``_ensure_requests()`` populates the module global at those call sites) so
+# importing this module on the tool-discovery path stays off the HTTP SDK's
+# import cost.
+
+
+def _ensure_requests():
+    if "requests" not in globals():
+        import requests as _requests
+        globals()["requests"] = _requests
+    return globals()["requests"]
+
+
+def __getattr__(name: str):
+    if name == "requests":
+        return _ensure_requests()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 from agent.secret_scope import get_secret
 from hermes_cli.config import cfg_get, load_config, read_raw_config
@@ -151,6 +167,7 @@ def is_camofox_mode() -> bool:
 
 def check_camofox_available() -> bool:
     """Verify the Camofox server is reachable."""
+    _ensure_requests()
     global _vnc_url, _vnc_url_checked
     url = get_camofox_url()
     if not url:
@@ -419,6 +436,7 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
 
 def _ensure_tab(task_id: Optional[str], url: str = "about:blank") -> Dict[str, Any]:
     """Ensure a tab exists for the session, creating one if needed."""
+    _ensure_requests()
     session = _get_session(task_id)
     if session["tab_id"]:
         return session
@@ -469,6 +487,7 @@ def camofox_soft_cleanup(task_id: Optional[str] = None) -> bool:
 
 def _post(path: str, body: dict, timeout: Optional[int] = None) -> dict:
     """POST JSON to camofox and return parsed response."""
+    _ensure_requests()
     if timeout is None:
         timeout = _get_command_timeout()
     url = f"{get_camofox_url()}{path}"
@@ -479,6 +498,7 @@ def _post(path: str, body: dict, timeout: Optional[int] = None) -> dict:
 
 def _get(path: str, params: dict = None, timeout: Optional[int] = None) -> dict:
     """GET from camofox and return parsed response."""
+    _ensure_requests()
     if timeout is None:
         timeout = _get_command_timeout()
     url = f"{get_camofox_url()}{path}"
@@ -489,6 +509,7 @@ def _get(path: str, params: dict = None, timeout: Optional[int] = None) -> dict:
 
 def _get_raw(path: str, params: dict = None, timeout: Optional[int] = None) -> requests.Response:
     """GET from camofox and return raw response (for binary data)."""
+    _ensure_requests()
     if timeout is None:
         timeout = _get_command_timeout()
     url = f"{get_camofox_url()}{path}"
@@ -499,6 +520,7 @@ def _get_raw(path: str, params: dict = None, timeout: Optional[int] = None) -> r
 
 def _delete(path: str, body: dict = None, timeout: Optional[int] = None) -> dict:
     """DELETE to camofox and return parsed response."""
+    _ensure_requests()
     if timeout is None:
         timeout = _get_command_timeout()
     url = f"{get_camofox_url()}{path}"
@@ -513,6 +535,7 @@ def _delete(path: str, body: dict = None, timeout: Optional[int] = None) -> dict
 
 def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
     """Navigate to a URL via Camofox."""
+    _ensure_requests()
     try:
         browser_url, rewrite_info = _rewrite_loopback_url_for_camofox(url)
         session = _get_session(task_id)

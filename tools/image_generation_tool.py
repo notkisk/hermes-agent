@@ -22,6 +22,7 @@ Pricing shown in UI strings is as-of the initial commit; we accept drift and
 update when it's noticed.
 """
 
+import importlib.util
 import json
 import logging
 import os
@@ -1471,11 +1472,12 @@ def check_image_generation_requirements() -> bool:
     """True if FAL or the explicitly configured image backend is available."""
     try:
         if check_fal_api_key():
-            # Trigger the lazy fal_client import here as the SDK presence
-            # check. Raises ImportError if the optional ``fal-client``
-            # package isn't installed; the caller's except ImportError
-            # below catches that and continues to plugin probing.
-            _load_fal_client()
+            # SDK-presence probe only: executing the fal_client import here
+            # cost ~40 ms of the startup path. find_spec answers "is the
+            # optional package installed?" without importing it; the real
+            # generation path still loads it lazily via _load_fal_client().
+            if importlib.util.find_spec("fal_client") is None:
+                raise ImportError("fal-client not installed")
             return True
     except ImportError:
         pass

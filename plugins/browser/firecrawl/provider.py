@@ -31,7 +31,24 @@ import os
 import uuid
 from typing import Any, Dict
 
-import requests
+# ``requests`` is only used by this provider's cloud-API calls below. Resolved
+# lazily (``_ensure_requests()`` populates the module global at those call
+# sites) so importing this module — which happens on the tool-discovery
+# path via ``tools/browser_tool.py``'s legacy re-exports — stays off the
+# HTTP SDK's import cost.
+
+
+def _ensure_requests():
+    if "requests" not in globals():
+        import requests as _m
+        globals()["requests"] = _m
+    return globals()["requests"]
+
+
+def __getattr__(name: str):
+    if name == "requests":
+        return _ensure_requests()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 from agent.browser_provider import BrowserProvider
 from agent.secret_scope import get_secret
@@ -79,6 +96,7 @@ class FirecrawlBrowserProvider(BrowserProvider):
         }
 
     def create_session(self, task_id: str) -> Dict[str, object]:
+        _ensure_requests()
         try:
             ttl = int(os.environ.get("FIRECRAWL_BROWSER_TTL", "300"))
         except (ValueError, TypeError):
@@ -117,6 +135,7 @@ class FirecrawlBrowserProvider(BrowserProvider):
         }
 
     def close_session(self, session_id: str) -> bool:
+        _ensure_requests()
         try:
             response = requests.delete(
                 f"{self._api_url()}/v2/browser/{session_id}",
@@ -139,6 +158,7 @@ class FirecrawlBrowserProvider(BrowserProvider):
             return False
 
     def emergency_cleanup(self, session_id: str) -> None:
+        _ensure_requests()
         if not self.is_available():
             logger.warning(
                 "Cannot emergency-cleanup Firecrawl session %s — missing credentials",

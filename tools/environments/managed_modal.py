@@ -5,7 +5,23 @@ from __future__ import annotations
 import json
 import logging
 import os
-import requests
+# ``requests`` is only used by the managed-modal API client below. Resolved
+# lazily (``_ensure_requests()`` populates the module global at those call
+# sites) so importing this module on the tool-discovery path stays off the
+# HTTP SDK's import cost.
+
+
+def _ensure_requests():
+    if "requests" not in globals():
+        import requests as _requests
+        globals()["requests"] = _requests
+    return globals()["requests"]
+
+
+def __getattr__(name: str):
+    if name == "requests":
+        return _ensure_requests()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
@@ -230,6 +246,7 @@ class ManagedModalEnvironment(BaseModalExecutionEnvironment):
                  json: Dict[str, Any] | None = None,
                  timeout: int = 30,
                  extra_headers: Dict[str, str] | None = None) -> requests.Response:
+        _ensure_requests()
         headers = {
             "Authorization": f"Bearer {self._nous_user_token}",
             "Content-Type": "application/json",
@@ -266,6 +283,7 @@ class ManagedModalEnvironment(BaseModalExecutionEnvironment):
 
     @staticmethod
     def _format_error(prefix: str, response: requests.Response) -> str:
+        _ensure_requests()
         try:
             payload = response.json()
             if isinstance(payload, dict):
