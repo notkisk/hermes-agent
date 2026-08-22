@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
@@ -403,6 +404,54 @@ def _load_endpoint_metadata_disk_entry(
     if not isinstance(data, dict) or not data or not isinstance(ts, (int, float)):
         return None
     return data, max(0.0, time.time() - float(ts))
+
+
+# Endpoints with a background refresh currently in flight. Guards against a
+# thread stampede when several callers hit the same stale entry before the
+# refresh lands.
+_endpoint_metadata_refresh_inflight: set = set()
+_endpoint_metadata_refresh_lock = threading.Lock()
+
+
+def _spawn_endpoint_metadata_refresh(normalized: str) -> None:
+    """Re-validate a stale disk entry off-thread (stale-while-revalidate).
+
+    The refresh reuses :func:`fetch_endpoint_model_metadata` with
+    ``force_refresh=True``, so a success updates the memory cache and the
+    disk L2, and a failure leaves both untouched (last-known-good wins).
+    Model catalogs and context windows change on human timescales, so
+    serving minutes-old metadata while a background probe converges beats
+    blocking the caller on a live round trip.
+    """
+
+    def _refresh() -> None:
+        try:
+            result = fetch_endpoint_model_metadata(normalized, force_refresh=True)
+            if not result:
+                # Live refresh failed (the failure path negative-caches {} in
+                # memory). Restore the last-known-good copy so callers keep
+                # serving stale data instead of an empty verdict until the
+                # next TTL window.
+                entry = _load_endpoint_metadata_disk_entry(normalized)
+                if entry is not None:
+                    _endpoint_model_metadata_cache[normalized] = entry[0]
+                    _endpoint_model_metadata_cache_time[normalized] = time.time()
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.debug(
+                "Background endpoint metadata refresh failed for %s: %s",
+                normalized, exc,
+            )
+        finally:
+            with _endpoint_metadata_refresh_lock:
+                _endpoint_metadata_refresh_inflight.discard(normalized)
+
+    with _endpoint_metadata_refresh_lock:
+        if normalized in _endpoint_metadata_refresh_inflight:
+            return
+        _endpoint_metadata_refresh_inflight.add(normalized)
+    threading.Thread(
+        target=_refresh, name="endpoint-metadata-refresh", daemon=True
+    ).start()
 
 
 def _save_endpoint_metadata_disk(
@@ -1344,25 +1393,38 @@ def fetch_endpoint_model_metadata(
         if cached is not None and (time.time() - cached_at) < _ENDPOINT_MODEL_CACHE_TTL:
             return cached
 
-    # Blackholed endpoint: every candidate below would spend its full 5s
-    # connect budget. Returned empty rather than cached, so the endpoint is
-    # retried as soon as the blackhole entry expires.
-    if _endpoint_blackholed(normalized):
-        return {}
-
-    # Disk L2: a fresh copy from a previous process serves instead of
-    # re-hitting ``/models`` — the in-process cache above dies with the
-    # process, which made every CLI cold start re-pay the live round trip.
+    # Disk L2: any existing copy serves before we consider the network. A
+    # fresh copy is returned outright; a stale copy is returned immediately
+    # while a background thread revalidates it (stale-while-revalidate).
+    # The in-process cache above dies with the process, and its 300 s TTL
+    # meant every CLI cold start more than five minutes after the last one
+    # re-paid the live ``/models`` round trip on this path.
     if not force_refresh:
         disk_entry = _load_endpoint_metadata_disk_entry(normalized)
-        if disk_entry is not None and disk_entry[1] < _ENDPOINT_METADATA_DISK_TTL_SECONDS:
-            _endpoint_model_metadata_cache[normalized] = disk_entry[0]
+        if disk_entry is not None:
+            disk_data, disk_age = disk_entry
+            _endpoint_model_metadata_cache[normalized] = disk_data
             _endpoint_model_metadata_cache_time[normalized] = time.time()
-            logger.debug(
-                "Served endpoint model metadata for %s from disk cache (%.0fs old)",
-                normalized, disk_entry[1],
-            )
-            return disk_entry[0]
+            if disk_age < _ENDPOINT_METADATA_DISK_TTL_SECONDS:
+                logger.debug(
+                    "Served endpoint model metadata for %s from disk cache (%.0fs old)",
+                    normalized, disk_age,
+                )
+            else:
+                logger.debug(
+                    "Served stale endpoint model metadata for %s from disk "
+                    "cache (%.0fs old); refreshing in background",
+                    normalized, disk_age,
+                )
+                _spawn_endpoint_metadata_refresh(normalized)
+            return disk_data
+
+    # Blackholed endpoint: every candidate below would spend its full 5s
+    # connect budget. Returned empty rather than cached, so the endpoint is
+    # retried as soon as the blackhole entry expires. Only reached when no
+    # disk copy exists at all — a known-good copy always wins over {}.
+    if _endpoint_blackholed(normalized):
+        return {}
 
     candidates = [normalized]
     if normalized.endswith("/v1"):

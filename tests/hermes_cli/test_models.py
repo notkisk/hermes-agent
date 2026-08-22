@@ -409,9 +409,24 @@ class TestNousRecommendedModels:
         mock_urlopen.assert_not_called()
         assert result == self._SAMPLE_PAYLOAD
 
-    def test_stale_disk_entry_fetches_live(self):
-        """A stale disk copy must not short-circuit; live fetch wins on success."""
+    def test_stale_disk_entry_serves_immediately_and_refreshes_in_background(self):
+        """Stale-while-revalidate: serve last-known-good now, refresh off-thread.
+
+        The in-process cache dies with the process; without SWR every CLI
+        start more than ten minutes after the previous one re-hit the Portal.
+        """
         import time as _time
+
+        captured = []
+
+        class _CapturingThread:
+            def __init__(self, target=None, name=None, daemon=False):
+                self._target = target
+                captured.append(self)
+
+            def start(self):
+                pass
+
         from hermes_cli.models import (
             fetch_nous_recommended_models,
             _nous_recommended_disk_path,
@@ -425,16 +440,26 @@ class TestNousRecommendedModels:
                 "ts": _time.time() - _NOUS_RECOMMENDED_CACHE_TTL - 1,
             }
         }))
+        with (
+            patch("hermes_cli.models._urlopen_model_catalog_request") as mock_urlopen,
+            patch("hermes_cli.models.threading.Thread", _CapturingThread),
+        ):
+            result = fetch_nous_recommended_models("https://portal.example.com")
+
+        mock_urlopen.assert_not_called()
+        assert result["freeRecommendedCompactionModel"]["modelName"] == "stale/model"
+        assert len(captured) == 1
+
         mock_cm = self._mock_urlopen(self._SAMPLE_PAYLOAD)
         with patch(
             "hermes_cli.models._urlopen_model_catalog_request", return_value=mock_cm
-        ) as mock_urlopen:
-            result = fetch_nous_recommended_models("https://portal.example.com")
-        mock_urlopen.assert_called_once()
-        assert result == self._SAMPLE_PAYLOAD
+        ):
+            captured[0]._target()
+        refreshed = fetch_nous_recommended_models("https://portal.example.com")
+        assert refreshed == self._SAMPLE_PAYLOAD
 
-    def test_stale_disk_entry_serves_when_live_fetch_fails(self):
-        """Last-known-good fallback for a STALE entry is preserved."""
+    def test_force_refresh_failure_falls_back_to_stale_disk(self):
+        """Last-known-good survives a failed explicit refresh."""
         import time as _time
         from hermes_cli.models import (
             fetch_nous_recommended_models,
@@ -456,7 +481,9 @@ class TestNousRecommendedModels:
             "hermes_cli.models._urlopen_model_catalog_request",
             side_effect=OSError("network down"),
         ):
-            result = fetch_nous_recommended_models("https://portal.example.com")
+            result = fetch_nous_recommended_models(
+                "https://portal.example.com", force_refresh=True
+            )
         assert result == stale_payload
 
     def test_force_refresh_bypasses_fresh_disk_cache(self):

@@ -856,20 +856,91 @@ class TestEndpointMetadataDiskCache:
         mock_get.assert_not_called()
         assert result["seed/model"]["context_length"] == 4096
 
-    def test_stale_disk_entry_refetches(self):
+    def test_stale_disk_entry_serves_immediately_and_refreshes_in_background(self):
+        """Stale-while-revalidate: serve last-known-good now, refresh off-thread.
+
+        The in-process TTL dies with the process; without SWR every CLI start
+        more than five minutes after the previous one re-paid the live
+        ``/models`` round trip on this path.
+        """
         import agent.model_metadata as mm
+
+        captured = []
+
+        class _CapturingThread:
+            def __init__(self, target=None, name=None, daemon=False):
+                self._target = target
+                captured.append(self)
+
+            def start(self):
+                pass
 
         ttl = mm._ENDPOINT_METADATA_DISK_TTL_SECONDS
         self._seed_disk(age_seconds=ttl + 1)
-        live = self._ok_response([{"id": "live/model"}])
-        with patch("agent.model_metadata.requests.get", return_value=live) as mock_get:
+        with (
+            patch("agent.model_metadata.requests.get") as mock_get,
+            patch("agent.model_metadata.threading.Thread", _CapturingThread),
+        ):
             result = mm.fetch_endpoint_model_metadata(self.URL)
 
-        assert mock_get.call_count >= 1
-        assert "live/model" in result
-        # The live fetch must overwrite the stale disk entry.
+        # Stale copy served without blocking on the network...
+        mock_get.assert_not_called()
+        assert result["seed/model"]["context_length"] == 4096
+        assert len(captured) == 1
+
+        # ...and the background refresh converges disk+memory to live data.
+        live = self._ok_response([{"id": "live/model"}])
+        with patch("agent.model_metadata.requests.get", return_value=live):
+            captured[0]._target()
         blob = self._read_disk()
         assert "live/model" in blob[self.URL]["data"]
+        assert "live/model" in mm._endpoint_model_metadata_cache[self.URL]
+
+    def test_background_refresh_failure_restores_last_known_good(self):
+        """A failed background refresh must not leave {} negative-cached."""
+        import agent.model_metadata as mm
+
+        captured = []
+
+        class _CapturingThread:
+            def __init__(self, target=None, name=None, daemon=False):
+                self._target = target
+                captured.append(self)
+
+            def start(self):
+                pass
+
+        ttl = mm._ENDPOINT_METADATA_DISK_TTL_SECONDS
+        self._seed_disk(age_seconds=ttl + 1)
+        with (
+            patch("agent.model_metadata.requests.get"),
+            patch("agent.model_metadata.threading.Thread", _CapturingThread),
+        ):
+            mm.fetch_endpoint_model_metadata(self.URL)
+
+        bad = MagicMock()
+        bad.status_code = 500
+        bad.raise_for_status.side_effect = RuntimeError("500")
+        with patch("agent.model_metadata.requests.get", return_value=bad):
+            captured[0]._target()
+
+        cached = mm._endpoint_model_metadata_cache.get(self.URL)
+        assert cached is not None
+        assert cached.get("seed/model", {}).get("context_length") == 4096
+
+    def test_blackholed_endpoint_with_disk_copy_serves_cached_data(self):
+        """A known-good disk copy wins over the blackhole short-circuit."""
+        import agent.model_metadata as mm
+
+        self._seed_disk(age_seconds=0.0)
+        mm._note_endpoint_blackholed(self.URL)
+        try:
+            with patch("agent.model_metadata.requests.get") as mock_get:
+                result = mm.fetch_endpoint_model_metadata(self.URL)
+            mock_get.assert_not_called()
+            assert result["seed/model"]["context_length"] == 4096
+        finally:
+            mm._endpoint_blackhole_cache.pop(mm._endpoint_host_key(self.URL), None)
 
     def test_successful_fetch_persists_to_disk(self):
         import agent.model_metadata as mm

@@ -991,6 +991,41 @@ _NOUS_RECOMMENDED_CACHE_TTL: int = 600  # seconds (10 minutes)
 # (result_dict, timestamp) keyed by portal_base_url so staging vs prod don't collide.
 _nous_recommended_cache: dict[str, tuple[dict[str, Any], float]] = {}
 
+# Portal bases with a background refresh currently in flight. Guards against
+# a thread stampede when several callers hit the same stale entry before the
+# refresh lands.
+_nous_recommended_refresh_inflight: set[str] = set()
+_nous_recommended_refresh_lock = threading.Lock()
+
+
+def _spawn_nous_recommended_refresh(base: str) -> None:
+    """Re-validate a stale disk entry off-thread (stale-while-revalidate).
+
+    The refresh reuses :func:`fetch_nous_recommended_models` with
+    ``force_refresh=True``, so a success refreshes both cache layers and a
+    failure leaves the stale last-known-good copy in place.
+    """
+
+    def _refresh() -> None:
+        try:
+            fetch_nous_recommended_models(base, force_refresh=True)
+        except Exception as exc:  # pragma: no cover — defensive
+            logging.getLogger(__name__).debug(
+                "nous recommended-models background refresh failed for %s: %s",
+                base, exc,
+            )
+        finally:
+            with _nous_recommended_refresh_lock:
+                _nous_recommended_refresh_inflight.discard(base)
+
+    with _nous_recommended_refresh_lock:
+        if base in _nous_recommended_refresh_inflight:
+            return
+        _nous_recommended_refresh_inflight.add(base)
+    threading.Thread(
+        target=_refresh, name="nous-recommended-refresh", daemon=True
+    ).start()
+
 
 def _nous_recommended_disk_path() -> "Path":
     """Disk path for the persisted recommended-models cache."""
@@ -1074,14 +1109,13 @@ def fetch_nous_recommended_models(
 
     The same TTL is honored across processes through a per-base disk cache
     (``$HERMES_HOME/cache/nous_recommended_cache.json``, written on every
-    successful live fetch): when the disk copy is fresh, it short-circuits
-    the live fetch entirely so a fresh CLI process doesn't re-hit the Portal
-    for data it already has. When the disk copy is stale it stays available
-    as last-known-good: if the live fetch fails (network, parse, non-2xx)
-    and the in-process cache is empty, the disk copy is returned instead of
-    ``{}`` — so a transient Portal hiccup no longer silently drops the
-    free/paid model recommendations from the picker. Self-heals on the next
-    successful fetch.
+    successful live fetch). A fresh disk copy short-circuits the live fetch;
+    a stale copy is still served immediately (recommendations change on
+    human timescales) while a background thread revalidates it — a fresh CLI
+    process never blocks on the Portal for data it already has. When there
+    is no cached copy at all and the live fetch fails (network, parse,
+    non-2xx), ``{}`` is returned so callers fall back to their own default.
+    Self-heals on the next successful fetch.
 
     Returns the parsed JSON dict, or ``{}`` only when neither the network nor
     any cache layer can supply data. Callers must treat missing/null fields
@@ -1095,12 +1129,23 @@ def fetch_nous_recommended_models(
         if now - cached_at < _NOUS_RECOMMENDED_CACHE_TTL:
             return payload
 
-    # Fresh cross-process copy: serve from disk without touching the network,
-    # exactly as the in-process cache would have served within this process.
+    # Cross-process copy: serve from disk without touching the network.
+    # Fresh copies are returned outright; stale copies are served
+    # immediately while a background thread revalidates them
+    # (stale-while-revalidate) — the in-process cache above dies with the
+    # process, which made every CLI start more than ten minutes after the
+    # last one re-hit the Portal on this path.
     if not force_refresh:
         disk_entry = _read_nous_recommended_disk_entry(base)
-        if disk_entry is not None and disk_entry[1] < _NOUS_RECOMMENDED_CACHE_TTL:
+        if disk_entry is not None:
             _nous_recommended_cache[base] = (disk_entry[0], now)
+            if disk_entry[1] < _NOUS_RECOMMENDED_CACHE_TTL:
+                return disk_entry[0]
+            logging.getLogger(__name__).debug(
+                "Serving stale nous recommended-models for %s (%.0fs old); "
+                "refreshing in background", base, disk_entry[1],
+            )
+            _spawn_nous_recommended_refresh(base)
             return disk_entry[0]
 
     url = f"{base}{NOUS_RECOMMENDED_MODELS_PATH}"

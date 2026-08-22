@@ -508,6 +508,14 @@ class TestVisionSafetyGuards:
 
 
 class TestVisionRequirements:
+    def setup_method(self):
+        import tools.vision_tools as vt
+        vt._vision_check_cache = (False, 0.0)
+
+    def teardown_method(self):
+        import tools.vision_tools as vt
+        vt._vision_check_cache = (False, 0.0)
+
     def test_check_requirements_accepts_codex_auth(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         (tmp_path / "auth.json").write_text(
@@ -523,6 +531,97 @@ class TestVisionRequirements:
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
         assert check_vision_requirements() is True
+
+    def test_ttl_cache_collapses_duplicate_chain_walks(self):
+        import tools.vision_tools as vt
+
+        calls = []
+
+        def fake_resolve(provider=None, model=None, **kwargs):
+            calls.append(provider)
+            # Explicit resolution succeeds on the first attempt.
+            return provider or "nous", object(), "some-model"
+
+        vt._vision_check_cache = (False, 0.0)
+        with patch(
+            "agent.auxiliary_client.resolve_vision_provider_client",
+            side_effect=fake_resolve,
+        ):
+            first = check_vision_requirements()
+            second = check_vision_requirements()
+
+        assert first is True
+        assert second is True
+        assert len(calls) == 1  # second call served from the TTL cache
+
+    def test_explicit_then_auto_fallback_computed_once(self):
+        import tools.vision_tools as vt
+
+        calls = []
+
+        def fake_resolve(provider=None, model=None, **kwargs):
+            calls.append(provider)
+            if provider == "auto":
+                return "openrouter", object(), "vision-model"
+            return None, None, None
+
+        vt._vision_check_cache = (False, 0.0)
+        with patch(
+            "agent.auxiliary_client.resolve_vision_provider_client",
+            side_effect=fake_resolve,
+        ):
+            first = check_vision_requirements()
+            second = check_vision_requirements()
+
+        assert first is True
+        assert second is True
+        # One full walk: explicit attempt + auto fallback, then cached.
+        assert calls == [None, "auto"]
+
+    def test_resolution_exception_cached_as_false(self):
+        import tools.vision_tools as vt
+
+        calls = []
+
+        def boom(provider=None, model=None, **kwargs):
+            calls.append(provider)
+            raise RuntimeError("boom")
+
+        vt._vision_check_cache = (False, 0.0)
+        with patch(
+            "agent.auxiliary_client.resolve_vision_provider_client",
+            side_effect=boom,
+        ):
+            first = check_vision_requirements()
+            second = check_vision_requirements()
+
+        assert first is False
+        assert second is False
+        # The exception aborted the single computation; the repeat call was
+        # served from the cache instead of re-raising.
+        assert len(calls) == 1
+
+    def test_ttl_cache_expires(self):
+        import time as _time
+        import tools.vision_tools as vt
+
+        calls = []
+
+        def fake_resolve(provider=None, model=None, **kwargs):
+            calls.append(provider)
+            return None, None, None
+
+        vt._vision_check_cache = (False, 0.0)
+        expired_ts = _time.monotonic() - vt._VISION_CHECK_TTL_SECONDS - 1
+        vt._vision_check_cache = (True, expired_ts)
+        with patch(
+            "agent.auxiliary_client.resolve_vision_provider_client",
+            side_effect=fake_resolve,
+        ):
+            result = check_vision_requirements()
+
+        assert result is False
+        assert len(calls) == 2  # cache expired — recomputed
 
 
 # ---------------------------------------------------------------------------

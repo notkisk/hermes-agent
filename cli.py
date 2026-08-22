@@ -17384,10 +17384,47 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             ] if item is not None
         ]
 
+    _agent_prewarm_started = False
+
+    def _start_agent_runtime_prewarm(self):
+        """Kick off the background import of run_agent + the OpenAI SDK.
+
+        Idempotent per instance — safe to call both before show_banner()
+        (to overlap imports with the banner/schema build) and again in the
+        post-banner idle window.
+        """
+        if HermesCLI._agent_prewarm_started:
+            return
+        HermesCLI._agent_prewarm_started = True
+
+        def _prewarm_agent_runtime() -> None:
+            try:
+                import run_agent  # noqa: F401  (imports model_tools + tool registry)
+                import openai  # noqa: F401
+            except Exception:
+                logger.debug("agent runtime pre-import failed", exc_info=True)
+
+        threading.Thread(
+            target=_prewarm_agent_runtime,
+            name="agent-runtime-prewarm",
+            daemon=True,
+        ).start()
+
     def run(self):
         """Run the interactive CLI loop with persistent input at bottom."""
         if not self._claim_active_session("cli"):
             return
+
+        # Start the agent-runtime pre-import BEFORE the banner rather than
+        # after it. The banner's tool-schema build constructs throwaway
+        # vision clients, which synchronously imports the OpenAI SDK
+        # (~0.3s) mid-render; run_agent's import is likewise needed for the
+        # first turn. Kicking both off now overlaps that work with the
+        # banner/schema build instead of serializing behind it. Python's
+        # import lock makes concurrent imports safe (see the post-banner
+        # prewarm below — this earlier start just widens its overlap).
+        if os.environ.get("HERMES_DEFER_AGENT_STARTUP") != "1":
+            self._start_agent_runtime_prewarm()
 
         # Detect light/dark terminal mode now (before pt grabs the tty).
         # Caches the result so subsequent _hex_to_ansi / style calls
@@ -17460,20 +17497,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # makes this safe: if the user submits before the warm finishes, the
         # main thread simply blocks on the remaining import work instead of
         # redoing it. Skipped when agent startup is explicitly deferred
-        # (Termux) — that path defers heavy work on purpose.
+        # (Termux) — that path defers heavy work on purpose. Usually a no-op:
+        # _start_agent_runtime_prewarm() already fired before show_banner().
         if os.environ.get("HERMES_DEFER_AGENT_STARTUP") != "1":
-            def _prewarm_agent_runtime() -> None:
-                try:
-                    import run_agent  # noqa: F401  (imports model_tools + tool registry)
-                    import openai  # noqa: F401
-                except Exception:
-                    logger.debug("agent runtime pre-import failed", exc_info=True)
-
-            threading.Thread(
-                target=_prewarm_agent_runtime,
-                name="agent-runtime-prewarm",
-                daemon=True,
-            ).start()
+            self._start_agent_runtime_prewarm()
 
         # Redaction opt-out warning (#17691): ON by default, loud when off.
         # The redactor snapshots its state at import time so any toggle now
