@@ -362,6 +362,74 @@ def _save_model_metadata_disk_cache(data: Dict[str, Dict[str, Any]]) -> None:
     except Exception as e:
         logger.debug("Failed to save OpenRouter model metadata disk cache: %s", e)
 
+# ── Disk L2 for custom-endpoint ``/models`` metadata ────────────────────────
+# Same rationale as the local-probe disk cache above: the in-process
+# ``_endpoint_model_metadata_cache`` dies with the process, so every CLI cold
+# start with a custom provider re-paid the live ``/models`` round trip (up to
+# 5 s connect + 10 s read) before the banner could render tool schemas — even
+# when the same endpoint answered seconds ago. Only SUCCESSFUL fetches are
+# persisted (a failing or auth-rejecting endpoint must not pin a negative
+# verdict), and entries expire after the same TTL as the memory cache, so the
+# staleness window is one the in-process cache already accepted.
+_ENDPOINT_METADATA_DISK_TTL_SECONDS = float(_ENDPOINT_MODEL_CACHE_TTL)
+
+
+def _endpoint_metadata_disk_cache_path() -> Path:
+    from hermes_constants import get_hermes_home
+    return get_hermes_home() / "cache" / "endpoint_model_metadata.json"
+
+
+def _load_endpoint_metadata_disk_entry(
+    normalized: str,
+) -> Optional[Tuple[Dict[str, Dict[str, Any]], float]]:
+    """Return ``(metadata, age_seconds)`` for ``normalized``, else None.
+
+    The disk file is a JSON object keyed by normalized base URL so unrelated
+    custom endpoints never collide:
+    ``{"<base>": {"data": {...}, "ts": <epoch_seconds>}}``.
+    """
+    try:
+        with _endpoint_metadata_disk_cache_path().open("r", encoding="utf-8") as f:
+            blob = json.load(f)
+    except Exception:
+        return None
+    if not isinstance(blob, dict):
+        return None
+    entry = blob.get(normalized)
+    if not isinstance(entry, dict):
+        return None
+    data = entry.get("data")
+    ts = entry.get("ts")
+    if not isinstance(data, dict) or not data or not isinstance(ts, (int, float)):
+        return None
+    return data, max(0.0, time.time() - float(ts))
+
+
+def _save_endpoint_metadata_disk(
+    normalized: str, data: Dict[str, Dict[str, Any]]
+) -> None:
+    """Persist a successful fetch as last-known-good for ``normalized``.
+
+    Merges into any existing per-endpoint map, then writes atomically.
+    Failures are non-fatal (logged at debug) — the in-process cache still
+    works.
+    """
+    if not data:
+        return
+    try:
+        path = _endpoint_metadata_disk_cache_path()
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                blob = json.load(f)
+            if not isinstance(blob, dict):
+                blob = {}
+        except Exception:
+            blob = {}
+        blob[normalized] = {"data": data, "ts": time.time()}
+        atomic_json_write(path, blob, indent=0, separators=(",", ":"))
+    except Exception as e:
+        logger.debug("Failed to save endpoint model metadata disk cache: %s", e)
+
 # Descending tiers for context length probing when the model is unknown.
 # We start at 256K (covers GPT-5.x, many current large-context models) and
 # step down on context-length errors until one works.  Tier[0] is also the
@@ -1282,6 +1350,20 @@ def fetch_endpoint_model_metadata(
     if _endpoint_blackholed(normalized):
         return {}
 
+    # Disk L2: a fresh copy from a previous process serves instead of
+    # re-hitting ``/models`` — the in-process cache above dies with the
+    # process, which made every CLI cold start re-pay the live round trip.
+    if not force_refresh:
+        disk_entry = _load_endpoint_metadata_disk_entry(normalized)
+        if disk_entry is not None and disk_entry[1] < _ENDPOINT_METADATA_DISK_TTL_SECONDS:
+            _endpoint_model_metadata_cache[normalized] = disk_entry[0]
+            _endpoint_model_metadata_cache_time[normalized] = time.time()
+            logger.debug(
+                "Served endpoint model metadata for %s from disk cache (%.0fs old)",
+                normalized, disk_entry[1],
+            )
+            return disk_entry[0]
+
     candidates = [normalized]
     if normalized.endswith("/v1"):
         alternate = normalized[:-3].rstrip("/")
@@ -1341,6 +1423,7 @@ def fetch_endpoint_model_metadata(
 
                 _endpoint_model_metadata_cache[normalized] = cache
                 _endpoint_model_metadata_cache_time[normalized] = time.time()
+                _save_endpoint_metadata_disk(normalized, cache)
                 return cache
         except Exception as exc:
             last_error = exc
@@ -1420,6 +1503,7 @@ def fetch_endpoint_model_metadata(
 
             _endpoint_model_metadata_cache[normalized] = cache
             _endpoint_model_metadata_cache_time[normalized] = time.time()
+            _save_endpoint_metadata_disk(normalized, cache)
             return cache
         except Exception as exc:
             last_error = exc

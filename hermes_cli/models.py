@@ -20,7 +20,7 @@ import urllib.error
 import time
 from difflib import get_close_matches
 from pathlib import Path
-from typing import Any, NamedTuple, Optional, TYPE_CHECKING
+from typing import Any, NamedTuple, Optional, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from typing import TypeGuard
@@ -998,8 +998,8 @@ def _nous_recommended_disk_path() -> "Path":
     return get_hermes_home() / "cache" / "nous_recommended_cache.json"
 
 
-def _read_nous_recommended_disk(base: str) -> dict[str, Any] | None:
-    """Return the last-known-good payload for ``base`` from disk, or None.
+def _read_nous_recommended_disk_entry(base: str) -> Optional[Tuple[dict[str, Any], float]]:
+    """Return ``(payload, age_seconds)`` for ``base`` from disk, or None.
 
     The disk file is a JSON object keyed by portal base URL so staging and
     prod don't collide:
@@ -1016,7 +1016,16 @@ def _read_nous_recommended_disk(base: str) -> dict[str, Any] | None:
     if not isinstance(entry, dict):
         return None
     data = entry.get("data")
-    return data if isinstance(data, dict) and data else None
+    ts = entry.get("ts")
+    if not isinstance(data, dict) or not data or not isinstance(ts, (int, float)):
+        return None
+    return data, max(0.0, time.time() - float(ts))
+
+
+def _read_nous_recommended_disk(base: str) -> dict[str, Any] | None:
+    """Return the last-known-good payload for ``base`` from disk, or None."""
+    entry = _read_nous_recommended_disk_entry(base)
+    return entry[0] if entry is not None else None
 
 
 def _write_nous_recommended_disk(base: str, data: dict[str, Any]) -> None:
@@ -1061,14 +1070,18 @@ def fetch_nous_recommended_models(
     Hits ``<portal>/api/nous/recommended-models``. The endpoint is public —
     no auth is required. Results are cached per portal URL for
     ``_NOUS_RECOMMENDED_CACHE_TTL`` seconds in process; pass
-    ``force_refresh=True`` to bypass the in-process cache.
+    ``force_refresh=True`` to bypass the caches.
 
-    A successful live fetch is also persisted to a per-base disk cache
-    (``$HERMES_HOME/cache/nous_recommended_cache.json``) as last-known-good.
-    When the live fetch fails (network, parse, non-2xx) and the in-process
-    cache is empty, the disk copy is returned instead of ``{}`` — so a
-    transient Portal hiccup no longer silently drops the free/paid model
-    recommendations from the picker. Self-heals on the next successful fetch.
+    The same TTL is honored across processes through a per-base disk cache
+    (``$HERMES_HOME/cache/nous_recommended_cache.json``, written on every
+    successful live fetch): when the disk copy is fresh, it short-circuits
+    the live fetch entirely so a fresh CLI process doesn't re-hit the Portal
+    for data it already has. When the disk copy is stale it stays available
+    as last-known-good: if the live fetch fails (network, parse, non-2xx)
+    and the in-process cache is empty, the disk copy is returned instead of
+    ``{}`` — so a transient Portal hiccup no longer silently drops the
+    free/paid model recommendations from the picker. Self-heals on the next
+    successful fetch.
 
     Returns the parsed JSON dict, or ``{}`` only when neither the network nor
     any cache layer can supply data. Callers must treat missing/null fields
@@ -1081,6 +1094,14 @@ def fetch_nous_recommended_models(
         payload, cached_at = cached
         if now - cached_at < _NOUS_RECOMMENDED_CACHE_TTL:
             return payload
+
+    # Fresh cross-process copy: serve from disk without touching the network,
+    # exactly as the in-process cache would have served within this process.
+    if not force_refresh:
+        disk_entry = _read_nous_recommended_disk_entry(base)
+        if disk_entry is not None and disk_entry[1] < _NOUS_RECOMMENDED_CACHE_TTL:
+            _nous_recommended_cache[base] = (disk_entry[0], now)
+            return disk_entry[0]
 
     url = f"{base}{NOUS_RECOMMENDED_MODELS_PATH}"
     try:

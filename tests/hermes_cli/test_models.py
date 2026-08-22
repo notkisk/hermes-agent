@@ -382,6 +382,108 @@ class TestNousRecommendedModels:
         assert b == self._SAMPLE_PAYLOAD
         assert mock_urlopen.call_count == 1  # second call served from cache
 
+    def test_fresh_disk_cache_skips_live_fetch(self):
+        """A fresh cross-process disk copy must serve without hitting the Portal.
+
+        The in-process cache dies with the process, so every CLI start used to
+        re-fetch even when the disk copy (written on every successful live
+        fetch) was seconds old.
+        """
+        import time as _time
+        from hermes_cli.models import (
+            fetch_nous_recommended_models,
+            _nous_recommended_disk_path,
+        )
+        path = _nous_recommended_disk_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "https://portal.example.com": {
+                "data": self._SAMPLE_PAYLOAD,
+                "ts": _time.time(),
+            }
+        }))
+        with patch(
+            "hermes_cli.models._urlopen_model_catalog_request"
+        ) as mock_urlopen:
+            result = fetch_nous_recommended_models("https://portal.example.com")
+        mock_urlopen.assert_not_called()
+        assert result == self._SAMPLE_PAYLOAD
+
+    def test_stale_disk_entry_fetches_live(self):
+        """A stale disk copy must not short-circuit; live fetch wins on success."""
+        import time as _time
+        from hermes_cli.models import (
+            fetch_nous_recommended_models,
+            _nous_recommended_disk_path,
+            _NOUS_RECOMMENDED_CACHE_TTL,
+        )
+        path = _nous_recommended_disk_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "https://portal.example.com": {
+                "data": {"freeRecommendedCompactionModel": {"modelName": "stale/model"}},
+                "ts": _time.time() - _NOUS_RECOMMENDED_CACHE_TTL - 1,
+            }
+        }))
+        mock_cm = self._mock_urlopen(self._SAMPLE_PAYLOAD)
+        with patch(
+            "hermes_cli.models._urlopen_model_catalog_request", return_value=mock_cm
+        ) as mock_urlopen:
+            result = fetch_nous_recommended_models("https://portal.example.com")
+        mock_urlopen.assert_called_once()
+        assert result == self._SAMPLE_PAYLOAD
+
+    def test_stale_disk_entry_serves_when_live_fetch_fails(self):
+        """Last-known-good fallback for a STALE entry is preserved."""
+        import time as _time
+        from hermes_cli.models import (
+            fetch_nous_recommended_models,
+            _nous_recommended_disk_path,
+            _NOUS_RECOMMENDED_CACHE_TTL,
+        )
+        stale_payload = {
+            "freeRecommendedCompactionModel": {"modelName": "stale/model"}
+        }
+        path = _nous_recommended_disk_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "https://portal.example.com": {
+                "data": stale_payload,
+                "ts": _time.time() - _NOUS_RECOMMENDED_CACHE_TTL - 1,
+            }
+        }))
+        with patch(
+            "hermes_cli.models._urlopen_model_catalog_request",
+            side_effect=OSError("network down"),
+        ):
+            result = fetch_nous_recommended_models("https://portal.example.com")
+        assert result == stale_payload
+
+    def test_force_refresh_bypasses_fresh_disk_cache(self):
+        import time as _time
+        from hermes_cli.models import (
+            fetch_nous_recommended_models,
+            _nous_recommended_disk_path,
+        )
+        path = _nous_recommended_disk_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "https://portal.example.com": {
+                "data": self._SAMPLE_PAYLOAD,
+                "ts": _time.time(),
+            }
+        }))
+        refreshed = dict(self._SAMPLE_PAYLOAD, refreshed=True)
+        mock_cm = self._mock_urlopen(refreshed)
+        with patch(
+            "hermes_cli.models._urlopen_model_catalog_request", return_value=mock_cm
+        ) as mock_urlopen:
+            result = fetch_nous_recommended_models(
+                "https://portal.example.com", force_refresh=True
+            )
+        mock_urlopen.assert_called_once()
+        assert result["refreshed"] is True
+
 
 
 

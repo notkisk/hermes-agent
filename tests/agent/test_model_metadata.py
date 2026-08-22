@@ -800,6 +800,113 @@ class TestFetchEndpointModelMetadata:
         success.close.assert_called_once()
 
 
+class TestEndpointMetadataDiskCache:
+    """The endpoint metadata disk L2 must serve a fresh copy across processes.
+
+    The in-process cache dies with the process, so every CLI cold start with
+    a custom provider re-paid the live ``/models`` round trip before the
+    banner could render. These tests pin the cross-process contract: fresh
+    disk entry short-circuits the network, stale entry re-fetches, only
+    successful fetches are persisted, and failures never poison the disk.
+    """
+
+    URL = "https://diskcache.example/v1"
+
+    def setup_method(self):
+        import agent.model_metadata as mm
+        mm._endpoint_model_metadata_cache.clear()
+        mm._endpoint_model_metadata_cache_time.clear()
+
+    def teardown_method(self):
+        import agent.model_metadata as mm
+        mm._endpoint_model_metadata_cache.clear()
+        mm._endpoint_model_metadata_cache_time.clear()
+
+    def _seed_disk(self, age_seconds=0.0):
+        import agent.model_metadata as mm
+        path = mm._endpoint_metadata_disk_cache_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            self.URL: {
+                "data": {"seed/model": {"name": "Seed", "context_length": 4096}},
+                "ts": time.time() - age_seconds,
+            }
+        }
+        path.write_text(__import__("json").dumps(payload))
+
+    def _read_disk(self):
+        import agent.model_metadata as mm
+        import json
+        return json.loads(mm._endpoint_metadata_disk_cache_path().read_text())
+
+    @staticmethod
+    def _ok_response(payload):
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {"data": payload}
+        return response
+
+    def test_fresh_disk_entry_serves_without_network(self):
+        import agent.model_metadata as mm
+
+        self._seed_disk(age_seconds=0.0)
+        with patch("agent.model_metadata.requests.get") as mock_get:
+            result = mm.fetch_endpoint_model_metadata(self.URL)
+
+        mock_get.assert_not_called()
+        assert result["seed/model"]["context_length"] == 4096
+
+    def test_stale_disk_entry_refetches(self):
+        import agent.model_metadata as mm
+
+        ttl = mm._ENDPOINT_METADATA_DISK_TTL_SECONDS
+        self._seed_disk(age_seconds=ttl + 1)
+        live = self._ok_response([{"id": "live/model"}])
+        with patch("agent.model_metadata.requests.get", return_value=live) as mock_get:
+            result = mm.fetch_endpoint_model_metadata(self.URL)
+
+        assert mock_get.call_count >= 1
+        assert "live/model" in result
+        # The live fetch must overwrite the stale disk entry.
+        blob = self._read_disk()
+        assert "live/model" in blob[self.URL]["data"]
+
+    def test_successful_fetch_persists_to_disk(self):
+        import agent.model_metadata as mm
+
+        live = self._ok_response([{"id": "persist/model", "context_length": 8192}])
+        with patch("agent.model_metadata.requests.get", return_value=live):
+            mm.fetch_endpoint_model_metadata(self.URL)
+
+        blob = self._read_disk()
+        entry = blob[self.URL]
+        assert entry["data"]["persist/model"]["context_length"] == 8192
+        assert abs(time.time() - entry["ts"]) < 30
+
+    def test_failed_fetch_leaves_disk_untouched(self):
+        import agent.model_metadata as mm
+
+        bad = MagicMock()
+        bad.status_code = 500
+        bad.raise_for_status.side_effect = RuntimeError("500")
+        with patch("agent.model_metadata.requests.get", return_value=bad) as mock_get:
+            result = mm.fetch_endpoint_model_metadata(self.URL + "-down")
+
+        assert result == {}
+        assert mm._load_endpoint_metadata_disk_entry(self.URL + "-down") is None
+
+    def test_force_refresh_bypasses_fresh_disk_entry(self):
+        import agent.model_metadata as mm
+
+        self._seed_disk(age_seconds=0.0)
+        live = self._ok_response([{"id": "refreshed/model"}])
+        with patch("agent.model_metadata.requests.get", return_value=live) as mock_get:
+            result = mm.fetch_endpoint_model_metadata(self.URL, force_refresh=True)
+
+        mock_get.assert_called()
+        assert "refreshed/model" in result
+
+
 # =========================================================================
 # Nous Portal context-window resolution (provider="nous")
 # =========================================================================
