@@ -1002,8 +1002,43 @@ def _relative_time(ts) -> str:
 _EARLY_PROVIDER_PROBE: dict = {"thread": None}
 
 
+def _preimport_model_tools() -> None:
+    # show_banner() pays ``import model_tools`` (the full tools/*.py
+    # discovery fan-out, ~80ms) inline on the paint-critical path. Running
+    # it on an early background thread overlaps that import with parser
+    # build, plugin discovery start, and the cli.py import; by banner time
+    # the module is in sys.modules and the import is free. Idempotent:
+    # whenever it lands, discovery runs exactly once.
+    try:
+        import model_tools  # noqa: F401
+    except Exception:
+        pass
+    # Same story for the tirith security scanner: its first call imports
+    # tools.tirith_security + resolves PATH/bin-dir candidates (~50-100ms
+    # cold). run()'s _ensure_tirith_security() then hits the module's
+    # resolved-path cache instead of paying that inline before layout.
+    try:
+        from tools.tirith_security import ensure_installed
+
+        ensure_installed(log_failures=False)
+    except Exception:
+        pass
+    # NOTE: prompt_toolkit deliberately NOT warmed here — ``import cli``
+    # pulls prompt_toolkit.history (most of the package) on the main
+    # thread anyway, so a second importer just duplicates work and adds
+    # GIL contention against cli.py's own import (measured: cli import
+    # 171ms standalone inflates to 530ms when raced).
+
+
 def _maybe_start_provider_probe_early(args) -> None:
-    """Start the provider probe off-thread when this run will enter cmd_chat."""
+    """Start the provider probe + heavy-import prework for chat launches.
+
+    Called from BOTH dispatch paths (fast-chat launch and main()'s post-parse
+    hook) — whichever runs first wins; the other is a no-op. Starting here
+    lets the ~90ms of probe config/auth-store reads and the model_tools /
+    tirith warm-up imports overlap parser build, plugin discovery start, and
+    the cli.py import instead of serializing inside cmd_chat's join.
+    """
     if _EARLY_PROVIDER_PROBE.get("thread") is not None:
         return
     if getattr(args, "version", False) or getattr(args, "oneshot", None):
@@ -1021,6 +1056,16 @@ def _maybe_start_provider_probe_early(args) -> None:
     t = threading.Thread(target=_run, name="provider-probe", daemon=True)
     _EARLY_PROVIDER_PROBE["thread"] = t
     t.start()
+
+    # Heavy warm-up imports ride the same early window. The GIL boost keeps
+    # their handoff storm with the main thread's own imports from inflating
+    # wall time; cli.run() restores the interval before the interactive loop.
+    _startup_fast.startup_gil_boost()
+    threading.Thread(
+        target=_preimport_model_tools,
+        name="model-tools-preimport",
+        daemon=True,
+    ).start()
 
 
 def _has_any_provider_configured() -> bool:
@@ -3011,36 +3056,11 @@ def cmd_chat(args):
         except Exception:
             _prework["providers_ok"] = True
 
-    def _preimport_model_tools() -> None:
-        # show_banner() pays ``import model_tools`` (the full tools/*.py
-        # discovery fan-out, ~80ms) inline on the paint-critical path. Kicking
-        # it here overlaps that import with the session/config pre-work above;
-        # by banner time the module is in sys.modules and the import is free.
-        # Idempotent: whenever it lands, discovery runs exactly once.
-        try:
-            import model_tools  # noqa: F401
-        except Exception:
-            pass
-        # Same story for the tirith security scanner: its first call imports
-        # tools.tirith_security + resolves PATH/bin-dir candidates (~50-100ms
-        # cold). run()'s _ensure_tirith_security() then hits the module's
-        # resolved-path cache instead of paying that inline before layout.
-        try:
-            from tools.tirith_security import ensure_installed
-
-            ensure_installed(log_failures=False)
-        except Exception:
-            pass
-        # And prompt_toolkit: always needed for the interactive input box,
-        # but imported lazily mid-run() (~120ms) right before the layout is
-        # built. Warm it here so app.run() reaches an already-loaded stack.
-        try:
-            import prompt_toolkit  # noqa: F401
-        except Exception:
-            pass
-
-    # main() may have started the probe during parser/dispatch dead time;
-    # reuse that thread (and its result slot) instead of probing twice.
+    # main() / the fast-chat path may have started the probe and the heavy
+    # warm-up imports during parser/dispatch dead time; reuse that probe
+    # thread (and its result slot) instead of probing twice. The prework
+    # thread needs no handle — nothing joins it, consumers just read warm
+    # module state.
     _early_probe = _EARLY_PROVIDER_PROBE.pop("thread", None)
     if _early_probe is not None:
         _probe_thread = _early_probe
@@ -3049,11 +3069,6 @@ def cmd_chat(args):
         _probe_thread = threading.Thread(
             target=_provider_probe, name="provider-probe", daemon=True
         )
-        # The heavier model_tools pre-import waits until after this probe's
-        # join below — letting them race from here serializes on one GIL and
-        # delayed the probe's completion past its join (measured 565ms vs
-        # ~110ms). Bundled-skills sync is owned by the background/first-run
-        # path further down; it must not be duplicated here.
         _probe_thread.start()
 
     use_tui = _resolve_use_tui(args)
@@ -3285,22 +3300,6 @@ def cmd_chat(args):
         threading.Thread(
             target=_skills_sync_bg, name="bundled-skills-sync", daemon=True
         ).start()
-
-    # Heavy warm-up imports (model_tools fan-out, tirith resolve,
-    # prompt_toolkit) start here so they overlap the session/config pre-work
-    # and the cli.py import below; by the time show_banner() and run() reach
-    # for those modules they are already in sys.modules. Started after the
-    # block above so the first-run foreground skills sync (which imports
-    # tools.skills_sync) isn't convoyed behind model_tools' walk of the
-    # ``tools`` package import lock; on later launches the background sync
-    # may overlap this thread harmlessly — nothing joins it before first
-    # paint, and a blocked import simply completes once.
-    _preimport_thread = threading.Thread(
-        target=_preimport_model_tools,
-        name="model-tools-preimport",
-        daemon=True,
-    )
-    _preimport_thread.start()
 
     # --yolo: bypass all dangerous command approvals.
     # Also set in main() before _prepare_agent_startup() — that is the

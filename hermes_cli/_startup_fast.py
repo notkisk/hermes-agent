@@ -41,6 +41,8 @@ __all__ = [
     "read_install_method",
     "print_fast_version_info",
     "try_fast_version",
+    "startup_gil_boost",
+    "startup_gil_restore",
 ]
 
 
@@ -273,3 +275,42 @@ def try_fast_version(argv: list[str] | None = None) -> bool:
 
     print_fast_version_info()
     return True
+
+
+# ── Startup GIL scheduling boost ────────────────────────────────────────────
+# During CLI startup the main thread races background warm-up threads
+# (model_tools fan-out, tirith resolve) for the GIL. CPython's default
+# switch interval (5ms) forces a handoff storm during that phase: measured
+# wall time inflates ~30-60ms beyond the sum of the serial costs because
+# both threads thrash caches mid-import. Raising the interval only for the
+# import-heavy window lets each thread run longer uninterrupted slices;
+# ``startup_gil_restore()`` puts the interpreter default back before the
+# interactive loop starts so runtime thread latency is untouched.
+
+_SWITCH_INTERVAL_BOOST_S = 0.050
+_switch_interval_saved: list = []
+
+
+def startup_gil_boost() -> None:
+    """Raise the GIL switch interval for the import-heavy startup window."""
+    if _switch_interval_saved:
+        return
+    try:
+        import sys as _sys
+
+        _switch_interval_saved.append(_sys.getswitchinterval())
+        _sys.setswitchinterval(_SWITCH_INTERVAL_BOOST_S)
+    except Exception:
+        _switch_interval_saved.clear()
+
+
+def startup_gil_restore() -> None:
+    """Restore the previous GIL switch interval (idempotent, never raises)."""
+    if not _switch_interval_saved:
+        return
+    try:
+        import sys as _sys
+
+        _sys.setswitchinterval(_switch_interval_saved.pop())
+    except Exception:
+        _switch_interval_saved.clear()

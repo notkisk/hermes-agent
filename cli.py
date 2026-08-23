@@ -20779,6 +20779,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     _enable_extended_enter_keys(app.output)
                 # Drive the petdex mascot animation (no-op when no pet enabled).
                 self._pet_start_anim()
+                # Startup's import-heavy phase is over: hand the scheduler its
+                # default GIL switch interval back so interactive thread
+                # latency (spinner, invalidate ticks) keeps normal granularity.
+                from hermes_cli._startup_fast import startup_gil_restore
+
+                startup_gil_restore()
                 app.run()
         except (EOFError, KeyboardInterrupt, BrokenPipeError):
             pass

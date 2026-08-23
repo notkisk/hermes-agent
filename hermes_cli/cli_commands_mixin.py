@@ -28,7 +28,13 @@ from rich.markup import escape as _escape
 from rich.panel import Panel
 
 from hermes_constants import display_hermes_home, is_termux as _is_termux_environment
-from agent.turn_context import extract_api_content_sidecar
+# NOTE: ``agent.turn_context`` (and the auxiliary-client/credential-pool
+# chain beneath it, ~65ms of imports) is NOT imported at module level —
+# its only use here is one runtime call site below. Importing it eagerly
+# dragged the whole chain into ``import cli``, which sits on the CLI
+# startup critical path before first paint. The function-level import in
+# ``_display_tool_result`` keeps behavior identical: first call pays the
+# import, long after the prompt is interactive.
 from hermes_cli.browser_connect import (
     DEFAULT_BROWSER_CDP_URL,
     discover_local_cdp_url,
@@ -1363,6 +1369,13 @@ class CLICommandsMixin:
         Inspired by Claude Code's /branch command.
         """
         from cli import _cprint, _sync_process_session_id
+        # Deferred (see import comment at module top): first /branch pays the
+        # turn_context chain, which is fine — the prompt is long since
+        # interactive by then.
+        from agent.turn_context import (
+            extract_api_content_sidecar as _extract_api_content_sidecar,
+        )
+
         if not self.conversation_history:
             _cprint("  No conversation to branch — send a message first.")
             return
@@ -1452,7 +1465,7 @@ class CLICommandsMixin:
                         # Keep the api_content sidecar so the branch's first turn
                         # replays the parent's exact wire bytes (warm provider
                         # prompt cache) instead of a full cold prefill.
-                        "api_content": extract_api_content_sidecar(msg),
+                        "api_content": _extract_api_content_sidecar(msg),
                         "timestamp": msg.get("timestamp"),
                     }
                     for msg in self.conversation_history
