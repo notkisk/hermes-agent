@@ -2956,6 +2956,36 @@ def _resolve_use_tui(args) -> bool:
 
 def cmd_chat(args):
     """Run interactive chat CLI."""
+    # Kick the two slowest pre-flight checks off-thread immediately so they
+    # overlap the xAI config scan, env setup, and the `import cli` module
+    # exec below. Both are joined right before their results are consumed;
+    # on any failure the provider probe fails open rather than blocking a
+    # configured user at the launch screen.
+    _prework: dict = {}
+
+    def _provider_probe() -> None:
+        try:
+            _prework["providers_ok"] = _has_any_provider_configured()
+        except Exception:
+            _prework["providers_ok"] = True
+
+    def _skills_sync_safe() -> None:
+        try:
+            _sync_bundled_skills_for_startup()
+        except Exception:
+            pass  # sync self-heals next launch; never block interactive start
+
+    _skills_thread = threading.Thread(
+        target=_skills_sync_safe,
+        name="skills-sync",
+        daemon=True,
+    )
+    _probe_thread = threading.Thread(
+        target=_provider_probe, name="provider-probe", daemon=True
+    )
+    _skills_thread.start()
+    _probe_thread.start()
+
     use_tui = _resolve_use_tui(args)
 
     _apply_safe_mode(args)
@@ -3092,8 +3122,11 @@ def cmd_chat(args):
     except Exception:
         pass
 
-    # First-run guard: check if any provider is configured before launching
-    if not _has_any_provider_configured():
+    # First-run guard: check if any provider is configured before launching.
+    # The probe runs off-thread (started at cmd_chat entry); join it here —
+    # by now it has usually finished overlapping the work above.
+    _probe_thread.join()
+    if not _prework.get("providers_ok", True):
         print()
         print(
             "It looks like Hermes isn't configured yet -- no API keys or providers found."

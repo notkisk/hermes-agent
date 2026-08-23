@@ -426,6 +426,11 @@ def _spawn_endpoint_metadata_refresh(normalized: str) -> None:
 
     def _refresh() -> None:
         try:
+            # Yield the interpreter to the startup critical path first: this
+            # thread is spawned during tool-schema assembly, and importing
+            # requests here would contend for the GIL with the remaining
+            # import work. Revalidation timing is not latency-sensitive.
+            time.sleep(1.0)
             result = fetch_endpoint_model_metadata(normalized, force_refresh=True)
             if not result:
                 # Live refresh failed (the failure path negative-caches {} in

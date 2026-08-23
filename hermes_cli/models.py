@@ -1008,6 +1008,10 @@ def _spawn_nous_recommended_refresh(base: str) -> None:
 
     def _refresh() -> None:
         try:
+            # Yield the interpreter to the startup critical path first (see
+            # the matching stagger in agent/model_metadata.py) — this thread
+            # is spawned during banner-time schema work.
+            time.sleep(1.0)
             fetch_nous_recommended_models(base, force_refresh=True)
         except Exception as exc:  # pragma: no cover — defensive
             logging.getLogger(__name__).debug(

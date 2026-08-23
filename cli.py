@@ -901,12 +901,50 @@ def AIAgent(*args, **kwargs):
     return _AIAgent(*args, **kwargs)
 
 
+def _tool_defs_cache_bypassed() -> bool:
+    from hermes_cli.tool_defs_cache import should_bypass_for_mcp
+    return should_bypass_for_mcp()
+
+
 def get_tool_definitions(*args, **kwargs):
     from hermes_cli.mcp_startup import wait_for_mcp_discovery
-    from model_tools import get_tool_definitions as _get_tool_definitions
 
     wait_for_mcp_discovery()
-    return _get_tool_definitions(*args, **kwargs)
+
+    # Fast path: a fingerprint-matched cache of the fully-resolved defs lets
+    # the banner render without importing model_tools at all — its import
+    # fans out into every tools/*.py module plus check_fns and schema
+    # assembly (~0.3s). Skipped whenever MCP servers are configured, since
+    # discovered MCP tools aren't covered by the fingerprint.
+    bypassed = _tool_defs_cache_bypassed()
+    key = None
+    if not bypassed:
+        try:
+            from hermes_cli.tool_defs_cache import cache_key, load_cached
+            key, _fp = cache_key(
+                enabled_toolsets=kwargs.get("enabled_toolsets"),
+                disabled_toolsets=kwargs.get("disabled_toolsets"),
+                platform=kwargs.get("platform") or "",
+                api_mode=kwargs.get("api_mode") or "",
+                skip_tool_search_assembly=bool(kwargs.get("skip_tool_search_assembly")),
+            )
+            cached = load_cached(key)
+            if cached is not None:
+                logger.debug("Served tool definitions from disk cache")
+                return [dict(d) for d in cached]
+        except Exception:
+            logger.debug("tool-defs cache read failed", exc_info=True)
+
+    from model_tools import get_tool_definitions as _get_tool_definitions
+
+    result = _get_tool_definitions(*args, **kwargs)
+    if key is not None and result:
+        try:
+            from hermes_cli.tool_defs_cache import store as _store
+            _store(key, result)
+        except Exception:
+            logger.debug("tool-defs cache write failed", exc_info=True)
+    return result
 
 
 def get_toolset_for_tool(*args, **kwargs):
@@ -3087,15 +3125,20 @@ def _query_osc11_background() -> str | None:
         # late and leak into prompt_toolkit's stdin.  DA1 is answered by
         # effectively every terminal ever made (it predates color), and on
         # real terminals the fence closes in single-digit milliseconds
-        # (herdr: <1ms, xterm/kitty/tmux: <5ms).  The 1s deadline is a
-        # safety net for a hypothetical terminal that ignores DA1 — not a
-        # window we ever expect to wait out.  A slow in-order relay that
-        # delivers the OSC 11 reply at e.g. 400ms is handled correctly:
-        # we keep listening until its DA1 reply follows, so the payload is
-        # consumed here instead of leaking as typed input (the "gibberish
-        # ANSI characters" seen inside terminal managers).
+        # (herdr: <1ms, xterm/kitty/tmux: <5ms).
+        #
+        # The 150 ms deadline is the budget for that fence, NOT a blind
+        # wait: every observed reply path closes it in <20 ms, so this only
+        # bites terminals that ignore BOTH queries — where the old 1 s
+        # deadline translated directly into a full second added to every
+        # launch (#40250-class environments, pty hosts, exotic muxes). A
+        # relay that delivers the OSC 11 reply after the deadline loses
+        # auto-theme detection (falls back to COLORFGBG/env hints/dark) but
+        # never leaks: the TCSAFLUSH below plus the post-flush drain still
+        # scrub late bytes out of the tty buffer before prompt_toolkit
+        # reads them.
         import select
-        deadline = time.monotonic() + 1.0
+        deadline = time.monotonic() + 0.15
         buf = b""
         while time.monotonic() < deadline:
             r, _, _ = select.select([fd], [], [], deadline - time.monotonic())
