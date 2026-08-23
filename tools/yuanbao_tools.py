@@ -19,6 +19,8 @@ accessed via ``get_active_adapter()``.
 from __future__ import annotations
 
 import logging
+import os
+import sys
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -419,13 +421,29 @@ from tools.registry import registry, tool_result  # noqa: E402
 
 def _check_yuanbao():
     """Toolset availability check — True when running in a yuanbao gateway session."""
-    try:
-        from gateway.session_context import get_session_env
-        if get_session_env("HERMES_SESSION_PLATFORM", "") == "yuanbao":
+    sc = sys.modules.get("gateway.session_context")
+    if sc is None:
+        # No session context exists in this process, so ``get_session_env``
+        # could only answer from its os.environ fallback. Check that directly:
+        # importing ``gateway.session_context`` pulls the whole ``gateway``
+        # package (~80ms), which this probe paid on every CLI cold start.
+        if os.getenv("HERMES_SESSION_PLATFORM", "") == "yuanbao":
             return True
-    except Exception:
-        pass
-    return _get_active_adapter() is not None
+    else:
+        try:
+            if sc.get_session_env("HERMES_SESSION_PLATFORM", "") == "yuanbao":
+                return True
+        except Exception:
+            pass
+    # The adapter singleton lives in ``gateway.platforms.yuanbao`` and can only
+    # be active if that module was already imported into this process (the
+    # gateway imports it when the platform connects). When it isn't loaded,
+    # importing it just to learn "no adapter" costs more gateway-platform
+    # imports on the startup path — skip straight to the same answer.
+    mod = sys.modules.get("gateway.platforms.yuanbao")
+    if mod is None:
+        return False
+    return mod.get_active_adapter() is not None
 
 
 async def _handle_yb_query_group_info(args, **kw):

@@ -67,6 +67,7 @@ Usage:
 """
 
 import json
+import hashlib
 import logging
 import time
 import threading
@@ -102,6 +103,107 @@ _SKILLS_CACHE: dict = {}          # {cache_key: (signature, timestamp, skills_li
 _SKILLS_CACHE_TTL_SECONDS = 30.0
 _SKILLS_CACHE_KEY_DISABLED = "with_disabled"
 _SKILLS_CACHE_KEY_FILTERED = "filtered"
+_SKILLS_DISK_CACHE_VERSION = 1
+
+
+def _disk_cache_path():
+    """Path of the cross-launch scan index (profile-scoped, like tool_defs_cache)."""
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / "cache" / "skills_scan_index.json"
+
+
+def _disk_cache_fingerprint(cache_key, dirs_to_scan, disabled) -> str | None:
+    """Digest of EVERYTHING the scan result depends on, at file granularity.
+
+    Per-index-file ``(path, mtime_ns, size)`` entries catch in-place SKILL.md
+    edits that the directory-level in-process signature cannot see, so a disk
+    hit is exactly as fresh as a full rescan — no TTL needed. Also covers the
+    disabled set, the platform filter input, and the environment-gate verdicts
+    (kanban's is context-dependent and may flip mid-process, so it must be
+    part of the key rather than trusted across contexts).
+    """
+    try:
+        from agent import skill_utils as _skill_utils
+        from agent.skill_utils import iter_skill_index_files
+
+        feed = [
+            _SKILLS_DISK_CACHE_VERSION,
+            cache_key,
+            tuple(sorted(disabled)),
+            getattr(getattr(_skill_utils, "sys", None), "platform", ""),
+        ]
+        for env in sorted(_skill_utils._KNOWN_ENVIRONMENTS):
+            feed.append(bool(_skill_utils._detect_environment(env)))
+        files: list = []
+        for scan_dir in dirs_to_scan:
+            for skill_md in iter_skill_index_files(scan_dir, "SKILL.md"):
+                try:
+                    st_ = skill_md.stat()
+                except OSError:
+                    continue
+                files.append((str(skill_md), st_.st_mtime_ns, st_.st_size))
+        files.sort()
+        feed.extend(files)
+        blob = repr(feed).encode("utf-8", errors="replace")
+        return hashlib.sha256(blob).hexdigest()
+    except Exception:
+        logger.debug("skills disk-cache fingerprint failed", exc_info=True)
+        return None
+
+
+def _load_disk_skills_scan(fingerprint):
+    """Return the cached skill list when the on-disk index matches *fingerprint*.
+
+    Returns ``None`` whenever anything is off (no file, changed inputs, corrupt
+    JSON, unwritable home) — the caller then rescans exactly as before.
+    """
+    if fingerprint is None:
+        return None
+    try:
+        raw = json.loads(
+            _disk_cache_path().read_text(encoding="utf-8")
+        )
+        if not isinstance(raw, dict) or raw.get("fingerprint") != fingerprint:
+            return None
+        skills = raw.get("skills")
+        if not isinstance(skills, list):
+            return None
+        out = []
+        for s in skills:
+            if (
+                isinstance(s, dict)
+                and isinstance(s.get("name"), str)
+                and isinstance(s.get("description"), str)
+                and isinstance(s.get("category"), str)
+            ):
+                out.append(dict(s))
+        return out
+    except Exception:
+        logger.debug("skills disk-cache read failed", exc_info=True)
+        return None
+
+
+def _write_disk_skills_scan(fingerprint, skills) -> None:
+    """Persist the scan result atomically; best-effort, never fatal.
+
+    *fingerprint* must be the one captured BEFORE the scan ran: a file that
+    changes mid-scan then mismatches on the next launch, forcing a fresh
+    scan instead of serving the torn result.
+    """
+    if fingerprint is None:
+        return
+    try:
+        path = _disk_cache_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(
+            json.dumps({"fingerprint": fingerprint, "skills": skills}),
+            encoding="utf-8",
+        )
+        os.replace(tmp, path)
+    except Exception:
+        logger.debug("skills disk-cache write failed", exc_info=True)
 
 
 def _skills_scan_signature(dirs_to_scan, disabled) -> tuple:
@@ -724,6 +826,19 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
         # out the cached objects would poison the cache for everyone else.
         return [dict(s) for s in cached[2]]
 
+    # Cold process: serve from the on-disk scan index when it still matches
+    # every input at file granularity (paths + mtimes + sizes, disabled set,
+    # platform, environment gates). A hit is as fresh as a rescan and saves
+    # re-reading every SKILL.md on each launch; anything unverifiable falls
+    # through to the full scan below. The fingerprint is captured BEFORE the
+    # scan and reused for the write-back so a file changing mid-scan can
+    # never pair a torn result with its post-change key.
+    disk_fingerprint = _disk_cache_fingerprint(cache_key, dirs_to_scan, disabled)
+    disk = _load_disk_skills_scan(disk_fingerprint)
+    if disk is not None:
+        _SKILLS_CACHE[cache_key] = (signature, now, disk)
+        return [dict(s) for s in disk]
+
     skills = []
     seen_names: set = set()
 
@@ -793,6 +908,7 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     # re-scans rather than serving the torn result past the TTL). Same
     # shallow-copy contract as the hit path — the caller may mutate.
     _SKILLS_CACHE[cache_key] = (signature, now, skills)
+    _write_disk_skills_scan(disk_fingerprint, skills)
     return [dict(s) for s in skills]
 
 

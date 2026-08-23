@@ -5605,6 +5605,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._pet_scale: float = 0.7
         self._pet_frames_cache: dict = {}  # state -> list[grid]
         self._pet_frame_idx: int = 0
+        self._pet_prefetch_started: bool = False
         self._pet_lock = threading.Lock()
         self._pet_cfg_checked: float = 0.0
         self._pet_anim_running: bool = False
@@ -6815,6 +6816,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     self._pet_enabled = False
                     self._pet_renderer = None
                     self._pet_frames_cache.clear()
+                    self._pet_prefetch_started = False
                 return
 
             pet = store.resolve_active_pet(slug)
@@ -6823,6 +6825,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     self._pet_enabled = False
                     self._pet_renderer = None
                     self._pet_frames_cache.clear()
+                    self._pet_prefetch_started = False
                 return
 
             with self._pet_lock:
@@ -6841,6 +6844,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     self._pet_scale = scale
                     self._pet_frames_cache.clear()
                     self._pet_frame_idx = 0
+                    self._pet_prefetch_started = False
                 self._pet_enabled = True
         except Exception:
             with self._pet_lock:
@@ -6912,13 +6916,66 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         renderer = self._pet_renderer
         if renderer is None:
             return []
-        try:
-            count = renderer.frame_count(state) or 1
-            grids = [renderer.cells(state, i, cols=self._pet_cols) for i in range(count)]
-        except Exception:
-            grids = []
-        self._pet_frames_cache[state] = grids
-        return grids
+        # First touch happens inside prompt_toolkit's synchronous
+        # preferred_height()/render path; decoding the spritesheet there
+        # blocked first paint for ~120ms. Return [] (the widget collapses to
+        # zero rows) and let the background prefetch fill the cache; the anim
+        # loop invalidates every frame tick, so the pet appears immediately
+        # after decode with identical visuals.
+        self._pet_prefetch_frames_async()
+        return []
+
+    def _pet_prefetch_frames_async(self) -> None:
+        """Decode every state's frames off-thread exactly once per renderer."""
+        renderer = self._pet_renderer
+        if renderer is None:
+            return
+        slug = self._pet_slug
+        cols = self._pet_cols
+        current_state = self._derive_pet_state()
+        if getattr(self, "_pet_prefetch_started", False):
+            return
+        self._pet_prefetch_started = True
+
+        def _decode_all() -> None:
+            try:
+                from agent.pet.state import PetState
+
+                states = [s.value for s in PetState]
+            except Exception:
+                states = [current_state]
+            # Current pose first so the pet pops in on the earliest tick.
+            states.sort(key=lambda s: s != current_state)
+            for state in states:
+                live = getattr(self, "_pet_renderer", None)
+                if (
+                    live is None
+                    or self._pet_slug != slug
+                    or self._pet_cols != cols
+                ):
+                    break  # pet switched/removed/rescaled mid-decode — drop stale work
+                try:
+                    count = live.frame_count(state) or 1
+                    grids = [live.cells(state, i, cols=cols) for i in range(count)]
+                except Exception:
+                    grids = []
+                with self._pet_lock:
+                    # Store only if the resolved pet hasn't been rebuilt while
+                    # we decoded (a rebuild clears the cache + resets the flag).
+                    if (
+                        self._pet_slug == slug
+                        and self._pet_cols == cols
+                        and self._pet_renderer is not None
+                    ):
+                        self._pet_frames_cache[state] = grids
+            app = getattr(self, "_app", None)
+            if app is not None:
+                try:
+                    app.invalidate()
+                except Exception:
+                    pass
+
+        threading.Thread(target=_decode_all, name="pet-frame-decode", daemon=True).start()
 
     def _pet_fragments(self):
         """Return prompt_toolkit FormattedText for the current pet frame, or []."""
@@ -17616,22 +17673,26 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Skill sync — best-effort periodic pull, piggy-backing on the
         # curator tick. Inert unless the access gate is open and a sync base
         # URL is configured; swallows all errors so it never blocks startup.
-        try:
-            from tools.skills_sync_client import maybe_pull_skills
-            maybe_pull_skills()
-        except Exception:
-            pass
-
-        # Org-shared skills — pull the organisation's approved set into the
-        # read-only mirror. Gated on real org membership: resolve_org_identity
-        # requires an org role on the token, which is only issued for
-        # multi-member organisations, so a solo account never reaches the
-        # network here. Fail-quiet, exactly like the personal pull above.
-        try:
+        # Both hooks resolve Nous credentials (file-locked auth-store read +
+        # SSL context, ~150ms cold) before they can decide they're inert, so
+        # they run off the prompt path in a daemon thread. They print nothing
+        # and their results were always discarded here; a pull that lands a
+        # moment later still surfaces via the next skills rescan.
+        def _periodic_skill_pulls() -> None:
             from tools.skills_sync_client import maybe_pull_org_skills
-            maybe_pull_org_skills()
-        except Exception:
-            pass
+            from tools.skills_sync_client import maybe_pull_skills
+
+            for _pull in (maybe_pull_skills, maybe_pull_org_skills):
+                try:
+                    _pull()
+                except Exception:
+                    pass
+
+        threading.Thread(
+            target=_periodic_skill_pulls,
+            name="skills-periodic-pull",
+            daemon=True,
+        ).start()
         _skills_for_line = self.preloaded_skills or list(
             getattr(self, "_preload_skills_requested", []) or []
         )

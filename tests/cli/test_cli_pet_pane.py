@@ -8,6 +8,7 @@ the real engine decode + half-block fragment building.
 from __future__ import annotations
 
 import threading
+import time
 
 import pytest
 
@@ -100,7 +101,15 @@ def test_pet_fragments_render_half_blocks(boba_like):
     cli_obj._pet_cols = 14
     cli_obj._pet_enabled = True
 
+    # Frames decode off-thread (keeps spritesheet work off prompt_toolkit's
+    # synchronous layout path at startup); the pane collapses to zero rows
+    # until they land, so wait for the background decode instead of expecting
+    # a synchronous height on first touch.
+    deadline = time.monotonic() + 5.0
     height = cli_obj._pet_widget_height()
+    while height <= 0 and time.monotonic() < deadline:
+        time.sleep(0.02)
+        height = cli_obj._pet_widget_height()
     assert height > 0
 
     frags = cli_obj._pet_fragments()

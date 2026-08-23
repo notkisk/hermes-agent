@@ -994,10 +994,39 @@ def _relative_time(ts) -> str:
     return relative_time(ts)
 
 
+# Early provider probe (first-run guard). main() starts it right after
+# argparse when the invocation is heading for interactive chat, so its
+# ~90ms of config/auth-store reads overlap parser build + dispatch instead
+# of serializing after them; cmd_chat joins this thread instead of making
+# its own.
+_EARLY_PROVIDER_PROBE: dict = {"thread": None}
+
+
+def _maybe_start_provider_probe_early(args) -> None:
+    """Start the provider probe off-thread when this run will enter cmd_chat."""
+    if _EARLY_PROVIDER_PROBE.get("thread") is not None:
+        return
+    if getattr(args, "version", False) or getattr(args, "oneshot", None):
+        return
+    if getattr(args, "command", None) not in (None, "chat"):
+        return
+
+    def _run() -> None:
+        try:
+            ok = _has_any_provider_configured()
+        except Exception:
+            ok = True  # fail open: a broken check must not block launch
+        _EARLY_PROVIDER_PROBE["providers_ok"] = ok
+
+    t = threading.Thread(target=_run, name="provider-probe", daemon=True)
+    _EARLY_PROVIDER_PROBE["thread"] = t
+    t.start()
+
+
 def _has_any_provider_configured() -> bool:
     """Check if at least one inference provider is usable."""
     from hermes_cli.config import get_env_path, get_hermes_home, load_config
-    from hermes_cli.auth import get_auth_status
+    from hermes_cli.auth import get_auth_status, get_nous_auth_status_local
 
     # Determine whether Hermes itself has been explicitly configured (model
     # in config that isn't the hardcoded default). Used below to gate external
@@ -1071,7 +1100,20 @@ def _has_any_provider_configured() -> bool:
             auth = json.loads(auth_file.read_text(encoding="utf-8-sig"))
             active = auth.get("active_provider")
             if active:
-                status = get_auth_status(active)
+                # Fast gate: the local snapshot answers "does a persisted
+                # Nous login exist that runtime could use or refresh?"
+                # without resolve_nous_runtime_credentials()' unconditional
+                # httpx.Client build (~75ms of SDK imports on this startup
+                # path) and without firing an OAuth refresh POST / consuming
+                # a single-use refresh token on every launch. If it reports
+                # no usable login, fall back to the full live check so the
+                # answer matches what a real resolution would find.
+                if active == "nous":
+                    status = get_nous_auth_status_local()
+                    if not status.get("logged_in"):
+                        status = get_auth_status(active)
+                else:
+                    status = get_auth_status(active)
                 if status.get("logged_in"):
                     return True
         except Exception:
@@ -2969,22 +3011,50 @@ def cmd_chat(args):
         except Exception:
             _prework["providers_ok"] = True
 
-    def _skills_sync_safe() -> None:
+    def _preimport_model_tools() -> None:
+        # show_banner() pays ``import model_tools`` (the full tools/*.py
+        # discovery fan-out, ~80ms) inline on the paint-critical path. Kicking
+        # it here overlaps that import with the session/config pre-work above;
+        # by banner time the module is in sys.modules and the import is free.
+        # Idempotent: whenever it lands, discovery runs exactly once.
         try:
-            _sync_bundled_skills_for_startup()
+            import model_tools  # noqa: F401
         except Exception:
-            pass  # sync self-heals next launch; never block interactive start
+            pass
+        # Same story for the tirith security scanner: its first call imports
+        # tools.tirith_security + resolves PATH/bin-dir candidates (~50-100ms
+        # cold). run()'s _ensure_tirith_security() then hits the module's
+        # resolved-path cache instead of paying that inline before layout.
+        try:
+            from tools.tirith_security import ensure_installed
 
-    _skills_thread = threading.Thread(
-        target=_skills_sync_safe,
-        name="skills-sync",
-        daemon=True,
-    )
-    _probe_thread = threading.Thread(
-        target=_provider_probe, name="provider-probe", daemon=True
-    )
-    _skills_thread.start()
-    _probe_thread.start()
+            ensure_installed(log_failures=False)
+        except Exception:
+            pass
+        # And prompt_toolkit: always needed for the interactive input box,
+        # but imported lazily mid-run() (~120ms) right before the layout is
+        # built. Warm it here so app.run() reaches an already-loaded stack.
+        try:
+            import prompt_toolkit  # noqa: F401
+        except Exception:
+            pass
+
+    # main() may have started the probe during parser/dispatch dead time;
+    # reuse that thread (and its result slot) instead of probing twice.
+    _early_probe = _EARLY_PROVIDER_PROBE.pop("thread", None)
+    if _early_probe is not None:
+        _probe_thread = _early_probe
+        _prework = _EARLY_PROVIDER_PROBE
+    else:
+        _probe_thread = threading.Thread(
+            target=_provider_probe, name="provider-probe", daemon=True
+        )
+        # The heavier model_tools pre-import waits until after this probe's
+        # join below — letting them race from here serializes on one GIL and
+        # delayed the probe's completion past its join (measured 565ms vs
+        # ~110ms). Bundled-skills sync is owned by the background/first-run
+        # path further down; it must not be duplicated here.
+        _probe_thread.start()
 
     use_tui = _resolve_use_tui(args)
 
@@ -3215,6 +3285,22 @@ def cmd_chat(args):
         threading.Thread(
             target=_skills_sync_bg, name="bundled-skills-sync", daemon=True
         ).start()
+
+    # Heavy warm-up imports (model_tools fan-out, tirith resolve,
+    # prompt_toolkit) start here so they overlap the session/config pre-work
+    # and the cli.py import below; by the time show_banner() and run() reach
+    # for those modules they are already in sys.modules. Started after the
+    # block above so the first-run foreground skills sync (which imports
+    # tools.skills_sync) isn't convoyed behind model_tools' walk of the
+    # ``tools`` package import lock; on later launches the background sync
+    # may overlap this thread harmlessly — nothing joins it before first
+    # paint, and a blocked import simply completes once.
+    _preimport_thread = threading.Thread(
+        target=_preimport_model_tools,
+        name="model-tools-preimport",
+        daemon=True,
+    )
+    _preimport_thread.start()
 
     # --yolo: bypass all dangerous command approvals.
     # Also set in main() before _prepare_agent_startup() — that is the
@@ -12264,6 +12350,12 @@ def _try_fast_chat_launch() -> bool:
     if (args.resume or args.continue_last) and args.command is None:
         args.command = "chat"
 
+    # Kick the first-run provider probe now — the fast path never reaches
+    # main()'s post-parse hook below, and its ~40-90ms of config/auth-store
+    # reads should overlap _prepare_agent_startup() + dispatch instead of
+    # serializing inside cmd_chat's join.
+    _maybe_start_provider_probe_early(args)
+
     _set_chat_arg_defaults(args)
     cmd_chat(args)
     return True
@@ -14231,6 +14323,11 @@ def main():
     # value is already False and --yolo silently does nothing.
     if getattr(args, "yolo", False):
         os.environ["HERMES_YOLO_MODE"] = "1"
+
+    # Kick the first-run provider probe now when this invocation is headed
+    # for interactive chat — its config/auth-store reads overlap the plugin
+    # discovery + dispatch work below instead of delaying cmd_chat's join.
+    _maybe_start_provider_probe_early(args)
 
     # Discover Python plugins and register shell hooks once, before any
     # command that can fire lifecycle hooks.  Both are idempotent; gated
