@@ -78,12 +78,26 @@ def resolve_exec_command() -> str:
             # third-party import (#90292) — silently, since Terminal=false.
             # sys.executable is the interpreter actually running Hermes (the
             # venv one), so prefix it explicitly.
-            argv = [str(Path(sys.executable).resolve()), str(resolved), "desktop"]
+            argv = [_running_interpreter(), str(resolved), "desktop"]
         else:
             argv = [str(resolved), "desktop"]
     else:
-        argv = [str(Path(sys.executable).resolve()), "-m", "hermes_cli.main", "desktop"]
+        argv = [_running_interpreter(), "-m", "hermes_cli.main", "desktop"]
     return " ".join(_quote_exec_arg(a) for a in argv)
+
+
+def _running_interpreter() -> str:
+    """The interpreter actually running Hermes, WITHOUT resolving symlinks.
+
+    ``Path(sys.executable).resolve()`` chases a venv's ``bin/python`` symlink
+    out to the base interpreter (uv-managed CPython, Homebrew, pyenv, ...).
+    The base interpreter cannot see the venv's site-packages, so an ``Exec=``
+    built from it made the DE spawn die with ModuleNotFoundError before the
+    app ever appeared — silently, since Terminal=false. ``abspath`` keeps the
+    venv identity that makes both the #90292 prefix and the module fallback
+    actually work.
+    """
+    return os.path.abspath(sys.executable)
 
 
 def _needs_interpreter(bin_path: Path) -> bool:
@@ -106,7 +120,12 @@ def _needs_interpreter(bin_path: Path) -> bool:
     # A python shebang pointing INSIDE the running interpreter's environment
     # already resolves correctly; anything else (``/usr/bin/env python3``,
     # a system path) would escape the venv when spawned by the DE.
-    exe_dir = str(Path(sys.executable).resolve().parent)
+    # Compare against the UNRESOLVED executable dir: resolving would chase
+    # the venv python's symlink out to the base interpreter and make every
+    # uv-style venv look like an escape. The shebang was lowercased above,
+    # so lower the dir too or any uppercase path component (``/home/me/Projects``)
+    # silently breaks the containment check.
+    exe_dir = os.path.dirname(os.path.abspath(sys.executable)).lower()
     return exe_dir not in shebang
 
 

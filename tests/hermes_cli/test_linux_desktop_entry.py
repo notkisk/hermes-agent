@@ -94,6 +94,7 @@ def test_exec_falls_back_to_interpreter_module(tmp_path, xdg_home, monkeypatch):
 # silent (Terminal=false). The Exec line must prefix sys.executable for any
 # resolved bin that is a python script escaping the running venv.
 def test_exec_prefixes_interpreter_for_env_shebang_python_script(tmp_path, xdg_home, monkeypatch):
+    import os
     import sys
 
     root = _make_project(tmp_path)
@@ -107,7 +108,10 @@ def test_exec_prefixes_interpreter_for_env_shebang_python_script(tmp_path, xdg_h
     entry = lde.install_desktop_entry(root)
     exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
 
-    interpreter = str(Path(sys.executable).resolve())
+    # The prefix must name the interpreter actually running Hermes — the
+    # UNRESOLVED sys.executable. .resolve() would chase a venv python symlink
+    # out to the base interpreter, which cannot see the venv's site-packages.
+    interpreter = os.path.abspath(sys.executable)
     assert exec_line.split(" ")[0].strip('"') == interpreter
     assert str(hermes_bin) in exec_line
     assert exec_line.endswith("desktop")
@@ -130,12 +134,13 @@ def test_exec_leaves_shell_wrapper_launchers_alone(tmp_path, xdg_home, monkeypat
 
 
 def test_exec_leaves_venv_shebang_scripts_alone(tmp_path, xdg_home, monkeypatch):
+    import os
     import sys
 
     root = _make_project(tmp_path)
     hermes_bin = tmp_path / "bin" / "hermes"
     hermes_bin.parent.mkdir()
-    interpreter = str(Path(sys.executable).resolve())
+    interpreter = os.path.abspath(sys.executable)
     hermes_bin.write_text(f"#!{interpreter}\nimport hermes_cli\n", encoding="utf-8")
     hermes_bin.chmod(0o755)
     monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: str(hermes_bin))
@@ -147,6 +152,74 @@ def test_exec_leaves_venv_shebang_scripts_alone(tmp_path, xdg_home, monkeypatch)
     # Console-script with the venv's own interpreter in the shebang: correct
     # as-is, prefixing would only add noise.
     assert exec_line == f"{hermes_bin} desktop"
+
+
+def _make_uv_style_venv(tmp_path: Path) -> "tuple[Path, Path, Path]":
+    """A venv whose bin/python3 symlinks OUT to a managed base CPython.
+
+    Mirrors uv-created venvs (``~/.hermes/hermes-agent/venv`` on the
+    reporter's machine): ``bin/python3 -> .../uv/python/cpython-3.11.x/bin/python3.11``.
+    Returns (venv_python, base_python, base_bin_dir).
+    """
+    base_bin = tmp_path / "uv" / "cpython-3.11.15-linux-x86_64-gnu" / "bin"
+    base_bin.mkdir(parents=True)
+    base_py = base_bin / "python3.11"
+    base_py.write_text("", encoding="utf-8")
+    base_py.chmod(0o755)
+
+    venv_bin = tmp_path / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    venv_py = venv_bin / "python3"
+    venv_py.symlink_to(base_py)
+    return venv_py, base_py, base_bin
+
+
+# Regression: the icon-launch failure on a uv-venv install. .resolve() chased
+# venv/bin/python3 through its symlink to the base interpreter, wrote THAT
+# into Exec, and the DE spawn ran the venv console script under a non-venv
+# python → ModuleNotFoundError on `import hermes_cli`, silent (Terminal=false).
+def test_exec_does_not_chase_venv_python_symlink_to_base(tmp_path, xdg_home, monkeypatch):
+    root = _make_project(tmp_path)
+    venv_py, _base_py, base_bin = _make_uv_style_venv(tmp_path)
+    hermes_bin = venv_py.parent / "hermes"
+    hermes_bin.write_text(f"#!{venv_py}\nimport sys\nfrom hermes_cli.main import main\n", encoding="utf-8")
+    hermes_bin.chmod(0o755)
+    monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: str(hermes_bin))
+    monkeypatch.setattr(lde.sys, "executable", str(venv_py))
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+
+    entry = lde.install_desktop_entry(root)
+    exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
+
+    # The shebang already names the venv interpreter — no prefix, and the
+    # base interpreter must not appear anywhere in the line.
+    assert exec_line == f"{hermes_bin} desktop"
+    assert str(base_bin) not in exec_line
+
+
+def test_exec_prefix_keeps_venv_identity_under_symlinked_interpreter(tmp_path, xdg_home, monkeypatch):
+    """The #90292 prefix (env-shebang script) must name the interpreter that
+    is actually running Hermes — the venv python — not the base CPython a
+    .resolve() chase would produce on a uv-style venv."""
+    import os
+
+    root = _make_project(tmp_path)
+    venv_py, _base_py, base_bin = _make_uv_style_venv(tmp_path)
+    repo_script = tmp_path / "checkout" / "hermes"
+    repo_script.parent.mkdir()
+    repo_script.write_text("#!/usr/bin/env python3\nimport hermes_cli\n", encoding="utf-8")
+    repo_script.chmod(0o755)
+    monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: str(repo_script))
+    monkeypatch.setattr(lde.sys, "executable", str(venv_py))
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+
+    entry = lde.install_desktop_entry(root)
+    exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
+
+    assert exec_line.split(" ")[0].strip('"') == os.path.abspath(str(venv_py))
+    assert str(base_bin) not in exec_line
+    assert str(repo_script) in exec_line
+    assert exec_line.endswith("desktop")
 
 
 def test_install_is_idempotent_and_skips_cache_refresh(tmp_path, xdg_home, monkeypatch):
