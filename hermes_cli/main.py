@@ -7843,6 +7843,62 @@ def _register_linux_desktop_entry() -> None:
         print(f"⚠ Could not install the desktop launcher entry: {exc}")
 
 
+def _desktop_detach_popen_kwargs(is_windows: bool) -> dict:
+    """Popen kwargs that cut the child's tie to this terminal.
+
+    Pure data-in/data-out so both platforms are testable from any host; the
+    spawn site only supplies ``os.name == "nt"``.
+
+    POSIX: ``start_new_session`` calls setsid() in the child — a new session
+    with no controlling terminal, so the SIGHUP a closed terminal sends can
+    never reach the app. Windows: DETACHED_PROCESS drops the inherited
+    console; CREATE_NEW_PROCESS_GROUP moves the child out of the console's
+    Ctrl-C group.
+    """
+    if is_windows:
+        return {
+            "creationflags": getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+        }
+    return {"start_new_session": True}
+
+
+def _launch_desktop_detached(command: list, *, cwd: Path, env) -> int:
+    """Spawn the desktop app detached from this terminal; return the child pid.
+
+    ``hermes desktop`` used to block on subprocess.run() for the app's whole
+    lifetime, which made the launching terminal the app's lifeline: closing
+    the terminal SIGHUP'd Electron away. The child now gets its own session
+    (or a detached Windows process), its stdio is redirected into
+    desktop.log, and the caller can exit right away. The installer's
+    --update flow has its own detached launcher and never relied on the old
+    blocking behavior; the desktop-spawned ``hermes serve`` backend belongs
+    to Electron either way, so its die-with-app lifecycle is unchanged.
+
+    Exits the process with status 1 if the spawn itself fails (missing
+    binary, bad permissions).
+    """
+    log_path = get_hermes_home() / "logs" / "desktop.log"
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "ab") as log_fh:
+            proc = subprocess.Popen(
+                command,
+                cwd=str(cwd),
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=log_fh,
+                stderr=subprocess.STDOUT,
+                **_desktop_detach_popen_kwargs(os.name == "nt"),
+            )
+    except OSError as exc:
+        print(f"✗ Could not launch Hermes Desktop: {exc}")
+        sys.exit(1)
+    print(f"✓ Hermes Desktop launched (pid {proc.pid}) — detached; it is safe to close this terminal.")
+    print(f"  App output: {log_path}")
+    return proc.pid
+
+
 def cmd_gui(args: argparse.Namespace):
     """Build and launch the native Electron desktop GUI."""
     desktop_dir = PROJECT_ROOT / "apps" / "desktop"
@@ -8097,8 +8153,8 @@ def cmd_gui(args: argparse.Namespace):
 
     if source_mode:
         print("→ Launching Hermes Desktop from source build...")
-        launch_result = subprocess.run([npm, "exec", "--", "electron", "."], cwd=desktop_dir, env=env, check=False)
-        sys.exit(launch_result.returncode)
+        _launch_desktop_detached([npm, "exec", "--", "electron", "."], cwd=desktop_dir, env=env)
+        sys.exit(0)
 
     if packaged_executable is None:
         print(f"✗ Desktop package build completed but no launchable app was found at: {desktop_dir / 'release'}")
@@ -8115,8 +8171,8 @@ def cmd_gui(args: argparse.Namespace):
 
     launch_command.extend(config_electron_flags)
     print(f"→ Launching packaged Hermes Desktop: {' '.join(launch_command)}")
-    launch_result = subprocess.run(launch_command, cwd=desktop_dir, env=env, check=False)
-    sys.exit(launch_result.returncode)
+    _launch_desktop_detached(launch_command, cwd=desktop_dir, env=env)
+    sys.exit(0)
 
 
 # Dashboard process-hygiene helpers live in hermes_cli/dashboard_procs.py

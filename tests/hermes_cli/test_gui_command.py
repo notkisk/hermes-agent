@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -105,7 +107,6 @@ def test_gui_installs_packages_and_launches_desktop_app(tmp_path, monkeypatch):
 
     install_ok = subprocess.CompletedProcess(["npm", "ci"], 0)
     pack_ok = subprocess.CompletedProcess(["npm", "run", "pack"], 0)
-    launch_ok = subprocess.CompletedProcess([str(packaged_exe)], 0)
 
     with patch("hermes_cli.main.shutil.which", return_value="/usr/bin/npm"), \
          patch("hermes_cli.main._run_npm_install_deterministic", return_value=install_ok) as mock_install, \
@@ -114,7 +115,8 @@ def test_gui_installs_packages_and_launches_desktop_app(tmp_path, monkeypatch):
          patch("hermes_cli.main._desktop_macos_relaunchable_fixup"), \
          patch("hermes_cli.main._desktop_linux_sandbox_fixup", return_value=True), \
          patch("hermes_cli.main._register_linux_desktop_entry"), \
-         patch("hermes_cli.main.subprocess.run", side_effect=[pack_ok, launch_ok]) as mock_run, \
+         patch("hermes_cli.main.subprocess.run", side_effect=[pack_ok]) as mock_run, \
+         patch("hermes_cli.main._launch_desktop_detached") as mock_launch, \
          pytest.raises(SystemExit) as exc:
         cli_main.cmd_gui(_ns())
 
@@ -126,10 +128,12 @@ def test_gui_installs_packages_and_launches_desktop_app(tmp_path, monkeypatch):
     assert mock_install.call_args.kwargs["capture_output"] is False
     install_env = mock_install.call_args.kwargs["env"]
     assert install_env is not None and "PATH" in install_env
-    assert mock_run.call_args_list[0].args[0] == ["/usr/bin/npm", "run", "pack"]
-    assert mock_run.call_args_list[0].kwargs["cwd"] == desktop_dir
-    assert mock_run.call_args_list[1].args[0] == [str(packaged_exe)]
-    assert mock_run.call_args_list[1].kwargs["cwd"] == desktop_dir
+    assert mock_run.call_args.args[0] == ["/usr/bin/npm", "run", "pack"]
+    assert mock_run.call_args.kwargs["cwd"] == desktop_dir
+    # The app itself launches detached (survives terminal close), not via a
+    # blocking subprocess.run.
+    assert mock_launch.call_args.args[0] == [str(packaged_exe)]
+    assert mock_launch.call_args.kwargs["cwd"] == desktop_dir
 
 
 def test_gui_install_env_prepends_managed_node_on_bare_path(tmp_path, monkeypatch):
@@ -154,7 +158,6 @@ def test_gui_install_env_prepends_managed_node_on_bare_path(tmp_path, monkeypatc
     monkeypatch.setenv("PATH", os.pathsep.join(["/usr/bin", "/bin"]))
 
     install_ok = subprocess.CompletedProcess(["npm", "ci"], 0)
-    launch_ok = subprocess.CompletedProcess(["hermes"], 0)
 
     # A plain return_value rather than a fixed side_effect list: this test only
     # cares about the env handed to the npm install, and pinning an exact
@@ -168,7 +171,8 @@ def test_gui_install_env_prepends_managed_node_on_bare_path(tmp_path, monkeypatc
          patch("hermes_cli.main._write_desktop_build_stamp"), \
          patch("hermes_cli.main._desktop_macos_relaunchable_fixup"), \
          patch("hermes_cli.main._desktop_linux_sandbox_fixup", return_value=True), \
-         patch("hermes_cli.main.subprocess.run", return_value=launch_ok), \
+         patch("hermes_cli.main.subprocess.run", return_value=install_ok), \
+         patch("hermes_cli.main._launch_desktop_detached"), \
          pytest.raises(SystemExit):
         cli_main.cmd_gui(_ns(skip_build=False))
 
@@ -512,12 +516,10 @@ def test_gui_registers_linux_desktop_entry_before_launch(tmp_path, monkeypatch):
         lambda project_root: registered.append(project_root) or (tmp_path / "hermes.desktop"),
     )
 
-    launch_ok = subprocess.CompletedProcess([str(packaged_exe)], 0)
-
     with patch("hermes_cli.main._desktop_build_needed", return_value=False), \
          patch("hermes_cli.main._resolve_node_runtime_npm", return_value="/usr/bin/npm"), \
          patch("hermes_cli.main._desktop_linux_sandbox_fixup", return_value=True), \
-         patch("hermes_cli.main.subprocess.run", return_value=launch_ok), \
+         patch("hermes_cli.main._launch_desktop_detached"), \
          pytest.raises(SystemExit):
         cli_main.cmd_gui(_ns())
 
@@ -537,17 +539,15 @@ def test_gui_launches_even_when_desktop_entry_install_fails(tmp_path, monkeypatc
     monkeypatch.setattr("hermes_cli.linux_desktop_entry.is_supported", lambda: True)
     monkeypatch.setattr("hermes_cli.linux_desktop_entry.install_desktop_entry", boom)
 
-    launch_ok = subprocess.CompletedProcess([str(packaged_exe)], 0)
-
     with patch("hermes_cli.main._desktop_build_needed", return_value=False), \
          patch("hermes_cli.main._resolve_node_runtime_npm", return_value="/usr/bin/npm"), \
          patch("hermes_cli.main._desktop_linux_sandbox_fixup", return_value=True), \
-         patch("hermes_cli.main.subprocess.run", return_value=launch_ok) as mock_run, \
+         patch("hermes_cli.main._launch_desktop_detached") as mock_launch, \
          pytest.raises(SystemExit) as exc:
         cli_main.cmd_gui(_ns())
 
     assert exc.value.code == 0
-    assert mock_run.call_args.args[0] == [str(packaged_exe)]
+    assert mock_launch.call_args.args[0] == [str(packaged_exe)]
 
 
 @pytest.mark.macos_only
@@ -563,12 +563,10 @@ def test_gui_skips_desktop_entry_off_linux(tmp_path, monkeypatch):
 
     monkeypatch.setattr("hermes_cli.linux_desktop_entry.install_desktop_entry", fail)
 
-    launch_ok = subprocess.CompletedProcess([str(packaged_exe)], 0)
-
     with patch("hermes_cli.main._desktop_build_needed", return_value=False), \
          patch("hermes_cli.main._resolve_node_runtime_npm", return_value="/usr/bin/npm"), \
          patch("hermes_cli.main._desktop_macos_relaunchable_fixup"), \
-         patch("hermes_cli.main.subprocess.run", return_value=launch_ok), \
+         patch("hermes_cli.main._launch_desktop_detached"), \
          pytest.raises(SystemExit) as exc:
         cli_main.cmd_gui(_ns())
 
@@ -633,11 +631,12 @@ def test_gui_bridges_ozone_hint_to_launch_env(tmp_path, monkeypatch):
          patch("hermes_cli.main._desktop_linux_sandbox_fixup", return_value=True), \
          patch("hermes_cli.config.load_config", return_value=cfg), \
          patch("hermes_cli.linux_desktop_entry.install_desktop_entry", return_value=None), \
-         patch("hermes_cli.main.subprocess.run", side_effect=[ok, ok]) as mock_run, \
+         patch("hermes_cli.main.subprocess.run", side_effect=[ok]) as mock_run, \
+         patch("hermes_cli.main._launch_desktop_detached") as mock_launch, \
          pytest.raises(SystemExit):
         cli_main.cmd_gui(_ns())
 
-    launch_env = mock_run.call_args_list[1].kwargs["env"]
+    launch_env = mock_launch.call_args.kwargs["env"]
     assert launch_env.get("ELECTRON_OZONE_PLATFORM_HINT") == "x11"
 
     monkeypatch.setenv("ELECTRON_OZONE_PLATFORM_HINT", "wayland")
@@ -649,11 +648,12 @@ def test_gui_bridges_ozone_hint_to_launch_env(tmp_path, monkeypatch):
          patch("hermes_cli.main._desktop_linux_sandbox_fixup", return_value=True), \
          patch("hermes_cli.config.load_config", return_value=cfg), \
          patch("hermes_cli.linux_desktop_entry.install_desktop_entry", return_value=None), \
-         patch("hermes_cli.main.subprocess.run", side_effect=[ok, ok]) as mock_run2, \
+         patch("hermes_cli.main.subprocess.run", side_effect=[ok]) as mock_run2, \
+         patch("hermes_cli.main._launch_desktop_detached") as mock_launch2, \
          pytest.raises(SystemExit):
         cli_main.cmd_gui(_ns())
 
-    launch_env = mock_run2.call_args_list[1].kwargs["env"]
+    launch_env = mock_launch2.call_args.kwargs["env"]
     assert launch_env.get("ELECTRON_OZONE_PLATFORM_HINT") == "wayland"
 
 
@@ -731,11 +731,12 @@ def test_gui_linux_packaged_launch_bridges_detected_password_store(tmp_path, mon
          patch("hermes_cli.config.load_config", return_value={}), \
          patch("hermes_cli.linux_desktop_entry.install_desktop_entry", return_value=None), \
          patch("hermes_cli.main._detect_linux_password_store", return_value="gnome-libsecret"), \
-         patch("hermes_cli.main.subprocess.run", side_effect=[ok, ok]) as mock_run, \
+         patch("hermes_cli.main.subprocess.run", side_effect=[ok]), \
+         patch("hermes_cli.main._launch_desktop_detached") as mock_launch, \
          pytest.raises(SystemExit):
         cli_main.cmd_gui(_ns())
 
-    launch_env = mock_run.call_args_list[1].kwargs["env"]
+    launch_env = mock_launch.call_args.kwargs["env"]
     assert launch_env["HERMES_DESKTOP_PASSWORD_STORE"] == "gnome-libsecret"
 
 
@@ -754,12 +755,13 @@ def test_gui_linux_source_launch_bridges_detected_password_store(tmp_path, monke
          patch("hermes_cli.config.load_config", return_value={}), \
          patch("hermes_cli.linux_desktop_entry.install_desktop_entry", return_value=None), \
          patch("hermes_cli.main._detect_linux_password_store", return_value="kwallet6"), \
-         patch("hermes_cli.main.subprocess.run", side_effect=[ok, ok]) as mock_run, \
+         patch("hermes_cli.main.subprocess.run", side_effect=[ok]), \
+         patch("hermes_cli.main._launch_desktop_detached") as mock_launch, \
          pytest.raises(SystemExit):
         cli_main.cmd_gui(_ns(source=True))
 
-    assert mock_run.call_args_list[1].args[0] == ["/usr/bin/npm", "exec", "--", "electron", "."]
-    launch_env = mock_run.call_args_list[1].kwargs["env"]
+    assert mock_launch.call_args.args[0] == ["/usr/bin/npm", "exec", "--", "electron", "."]
+    launch_env = mock_launch.call_args.kwargs["env"]
     assert launch_env["HERMES_DESKTOP_PASSWORD_STORE"] == "kwallet6"
 
 
@@ -782,12 +784,13 @@ def test_gui_config_password_store_skips_detection(tmp_path, monkeypatch):
          patch("hermes_cli.config.load_config", return_value=cfg), \
          patch("hermes_cli.linux_desktop_entry.install_desktop_entry", return_value=None), \
          patch("hermes_cli.main._detect_linux_password_store") as mock_detect, \
-         patch("hermes_cli.main.subprocess.run", side_effect=[ok, ok]) as mock_run, \
+         patch("hermes_cli.main.subprocess.run", side_effect=[ok]), \
+         patch("hermes_cli.main._launch_desktop_detached") as mock_launch, \
          pytest.raises(SystemExit):
         cli_main.cmd_gui(_ns())
 
     mock_detect.assert_not_called()
-    launch_env = mock_run.call_args_list[1].kwargs["env"]
+    launch_env = mock_launch.call_args.kwargs["env"]
     assert launch_env["HERMES_DESKTOP_PASSWORD_STORE"] == "kwallet6"
 
 
@@ -811,12 +814,13 @@ def test_gui_explicit_password_store_env_wins_over_config_and_detection(tmp_path
          patch("hermes_cli.config.load_config", return_value=cfg), \
          patch("hermes_cli.linux_desktop_entry.install_desktop_entry", return_value=None), \
          patch("hermes_cli.main._detect_linux_password_store") as mock_detect, \
-         patch("hermes_cli.main.subprocess.run", side_effect=[ok, ok]) as mock_run, \
+         patch("hermes_cli.main.subprocess.run", side_effect=[ok]), \
+         patch("hermes_cli.main._launch_desktop_detached") as mock_launch, \
          pytest.raises(SystemExit):
         cli_main.cmd_gui(_ns())
 
     mock_detect.assert_not_called()
-    launch_env = mock_run.call_args_list[1].kwargs["env"]
+    launch_env = mock_launch.call_args.kwargs["env"]
     assert launch_env["HERMES_DESKTOP_PASSWORD_STORE"] == "basic"
 
 
@@ -837,10 +841,103 @@ def test_gui_password_store_bridge_is_linux_only(tmp_path, monkeypatch):
          patch("hermes_cli.config.load_config", return_value={}), \
          patch("hermes_cli.linux_desktop_entry.install_desktop_entry", return_value=None), \
          patch("hermes_cli.main._detect_linux_password_store") as mock_detect, \
-         patch("hermes_cli.main.subprocess.run", side_effect=[ok, ok]) as mock_run, \
+         patch("hermes_cli.main.subprocess.run", side_effect=[ok]), \
+         patch("hermes_cli.main._launch_desktop_detached") as mock_launch, \
          pytest.raises(SystemExit):
         cli_main.cmd_gui(_ns())
 
     mock_detect.assert_not_called()
-    launch_env = mock_run.call_args_list[1].kwargs["env"]
+    launch_env = mock_launch.call_args.kwargs["env"]
     assert "HERMES_DESKTOP_PASSWORD_STORE" not in launch_env
+
+
+# --- detached launch (app must survive terminal close) ---------------------
+
+
+def test_desktop_detach_popen_kwargs_posix():
+    """Pure data-in/data-out: the POSIX half is testable on any host."""
+    kwargs = cli_main._desktop_detach_popen_kwargs(is_windows=False)
+    assert kwargs == {"start_new_session": True}
+    assert "creationflags" not in kwargs
+
+
+def test_desktop_detach_popen_kwargs_windows():
+    """Pure data-in/data-out: the Windows half is testable on any host."""
+    kwargs = cli_main._desktop_detach_popen_kwargs(is_windows=True)
+    # DETACHED_PROCESS (0x8) | CREATE_NEW_PROCESS_GROUP (0x200)
+    assert kwargs["creationflags"] == 0x00000008 | 0x00000200
+    assert "start_new_session" not in kwargs
+
+
+def test_launch_desktop_detached_spawns_own_session_and_returns_pid(tmp_path, monkeypatch, capsys):
+    """The spawn must detach the child (POSIX: own session), point its stdio
+    at desktop.log, and hand the pid back so the CLI can exit right away."""
+    launched: dict = {}
+
+    class FakeProc:
+        pid = 4242
+
+    def fake_popen(command, **kwargs):
+        launched["command"] = command
+        launched.update(kwargs)
+        return FakeProc()
+
+    monkeypatch.setattr(cli_main.subprocess, "Popen", fake_popen)
+
+    pid = cli_main._launch_desktop_detached(
+        ["electron", "."], cwd=tmp_path, env={"PATH": "/usr/bin"}
+    )
+
+    assert pid == 4242
+    assert launched["command"] == ["electron", "."]
+    assert launched["cwd"] == str(tmp_path)
+    assert launched["env"] == {"PATH": "/usr/bin"}
+    assert launched["stdin"] == subprocess.DEVNULL
+    assert launched["stderr"] == subprocess.STDOUT
+    assert launched["stdout"] is not None
+    if sys.platform == "win32":
+        assert "creationflags" in launched
+    else:
+        assert launched["start_new_session"] is True
+    # The log target is HERMES_HOME/logs/desktop.log and its directory was
+    # created for the redirect.
+    from hermes_cli.config import get_hermes_home
+
+    assert Path(launched["stdout"].name) == get_hermes_home() / "logs" / "desktop.log"
+    out = capsys.readouterr().out
+    assert "pid 4242" in out
+    assert "safe to close" in out
+
+
+def test_launch_desktop_detached_exits_on_spawn_failure(tmp_path, monkeypatch):
+    """A missing binary must fail loudly (exit 1), not traceback."""
+    def boom(*_args, **_kwargs):
+        raise FileNotFoundError("electron dist missing")
+
+    monkeypatch.setattr(cli_main.subprocess, "Popen", boom)
+
+    with pytest.raises(SystemExit) as exc:
+        cli_main._launch_desktop_detached(["nope"], cwd=tmp_path, env={})
+    assert exc.value.code == 1
+
+
+@pytest.mark.linux_only
+def test_launch_desktop_detached_child_survives_and_logs_for_real(tmp_path):
+    """E2E on the real host: a detached child outlives the spawning call and
+    its stdout lands in desktop.log — no mocks, real setsid + fd redirect."""
+    log_path = cli_main.get_hermes_home() / "logs" / "desktop.log"
+    marker = f"detach-e2e-marker-{os.getpid()}"
+    pid = cli_main._launch_desktop_detached(
+        [sys.executable, "-c", f"print('{marker}')"],
+        cwd=tmp_path,
+        env=dict(os.environ),
+    )
+    assert pid > 0
+
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if log_path.exists() and marker in log_path.read_text(encoding="utf-8", errors="replace"):
+            break
+        time.sleep(0.1)
+    else:
+        pytest.fail(f"detached child output never reached {log_path} within 10s")
